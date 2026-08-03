@@ -1,104 +1,77 @@
-# Murphy M4 / Fengyan 阅读器固件
+# Murphy M4 / Fengyan 阅读器 — 简易使用介绍
 
-ESP32-S3 墨水屏阅读器固件（480×800 E-Ink），采用**双 OTA** 结构：APP0 为原厂系统，APP1 为本固件。支持插件体系（Lua 沙箱）、原生阅读器、宿主列表场景与内容提供管线。
+ESP32-S3 墨水屏阅读器固件（480×800 E-Ink）。通过 SD 卡在原厂系统中一键升级，无需电脑刷机。
 
-> 配套插件：[m4-weread-plugin](https://github.com/einklover/m4-weread-plugin)（微信读书）、[m4-fanqie-plugin](https://github.com/einklover/m4-fanqie-plugin)（番茄小说）。
+## 一、SD 卡准备
 
-## 一、刷写固件
+把以下内容放入 SD 卡（FAT32）：
 
-### 前置
-
-- 设备通过 USB 连接电脑，出现 `/dev/cu.usbmodemXXX` 串口
-- 安装 PlatformIO：`pip install platformio`（或使用 IDE 插件）
-
-### 安全刷写（仅 APP1）
-
-默认只写 APP1 分区（`0x6e0000`），**不会触碰** APP0 / bootloader / 分区表 / NVS：
-
-```bash
-python3 scripts/murphy_m4_app1_flash.py \
-  --port /dev/cu.usbmodemXXX \
-  --firmware .pio/build/murphy_m4/firmware.bin \
-  --i-understand-app1-only
+```
+SD 卡根目录/
+├── firmware.bin      ← 固件文件（本仓库构建产物）
+├── fonts/            ← 字体文件夹（放入 NotoSansCJKsc.epdfont 获得完整中文）
+└── app/              ← 插件文件夹（放入 fanqie.m4x、weread.m4x）
 ```
 
-刷写完成后设备自动切到 APP1 启动。如需返回原厂 APP0（仅切槽，不擦除）：
+> 没有 fonts/ 也能用（内置常用中文字体子集）；完整字体建议放入。
 
-```bash
-python3 scripts/murphy_m4_app1_flash.py --port /dev/cu.usbmodemXXX --select-slot 0
-```
+## 二、升级固件
 
-### 串口纪律（重要）
+1. 插入 SD 卡，开机进入**原厂系统**
+2. 打开原厂系统的「**升级**」入口，选择 SD 卡中的 `firmware.bin`
+3. 升级完成后固件**自动写入另一分区（APP1）并打开**——即进入本阅读器系统
 
-- 同一时间只允许一个程序占用串口（不要同时开串口监视器/多个调试工具）
-- 反复开关串口会导致设备复位；优先使用持续会话
-- 设备静默无响应时，先**断电重启**，不要反复重试
+之后每次想要更新：把新 `firmware.bin` 复制到 SD 卡根目录，重复上述步骤即可。
 
-## 二、安装插件
+## 三、连接 Wi-Fi
 
-插件为 `.m4x` 包（zip 格式，含 `manifest.json` 与 `main.lua` 入口）。三种安装方式：
+在系统的「**网络管理 / Wi-Fi 设置**」中连接家里的无线网络（用于获取书籍内容）。
 
-### 1. Wi-Fi / 串口安装（推荐，需开启 USB 串口调试）
+## 四、安装插件
 
-```bash
-python3 scripts/m4adb.py --port /dev/cu.usbmodemXXX install fanqie.m4x
-```
+在「**应用 / 安装**」入口，从 SD 卡 `app/` 文件夹中选择安装两个插件：
 
-默认优先走局域网 Wi-Fi 传输，失败自动回退串口。也可指定 `--transport wifi` 或 `--transport usb`。返回 `noop: true` 表示设备已有同版本，无需重复安装。
+- `fanqie.m4x` — 番茄小说
+- `weread.m4x` — 微信读书
 
-### 2. SD 卡安装
-
-把 `.m4x` 放入 SD 卡 `/apps_inbox/`，在设备「应用 / 安装」入口选择安装。
-
-### 3. 源码目录安装（开发用）
-
-```bash
-python3 scripts/m4adb.py --port /dev/cu.usbmodemXXX install ./fanqie_src
-```
-
-## 三、日常使用
-
-- **书架**：已打开的书会保留进度；第一行「分类浏览」进入分类书单
-- **书单**：底部左右键翻页，已看过的页会缓存（回翻秒开），无需反复等待网络
-- **目录**：FileRows 大目录按需读取，章节在后台预取
-- **阅读器**：点击右半屏翻下一页，左半屏回上一页；章节末尾自动加载下一章
-- **返回**：顶栏或返回键逐级退出
-
-## 四、插件功能
-
-### WeRead（微信读书）
-
-扫码登录后自动续期会话；章节按分片协议下载并加密缓存，支持离线阅读。
+## 五、插件使用方法
 
 ### Fanqie（番茄小说）
 
-无需账号；分类 → 书单 → 书籍 → 章节全链路，远程分页书单与 FileRows 目录。
+1. 书架 → 第一行「**分类浏览**」
+2. 选择分类（都市 / 玄幻 / 出版…）进入书单
+3. 底部左右键翻页（已看过的页秒开），点书打开目录
+4. 点章节进入阅读：右半屏下一页、左半屏上一页、章节末尾自动加载下一章
+5. 无需账号
 
-## 五、常见问题
+### WeRead（微信读书）
 
-| 现象 | 处理 |
+1. 打开插件 → 按提示**扫码登录**（微信读书网页版二维码）
+2. 书架显示已购/在读书籍，打开即读
+3. 章节自动缓存，支持离线阅读
+4. 登录态自动续期，无需反复扫码
+
+## 六、切换回原固件
+
+在**系统设置**中选择「**切换系统 / 返回原固件**」即可切回原厂系统（不擦除任何数据）。随时可以再升级回来。
+
+## 七、常见问题
+
+| 问题 | 解决 |
 |---|---|
-| 插件安装返回瞬态 SD 写失败 | 重试一次；`install` 返回 `noop:true` 即已装好 |
-| 阅读器打开章节失败 | 确认已连接 Wi-Fi；Fanqie 内容走公开镜像，免证书校验 |
-| 设备无响应/串口静默 | 断电重启（长按电源或拔电） |
-| 中文缺失 | 将 NotoSansCJKsc.epdfont 放入 SD 卡 `/fonts/` 获得完整 CJK 字体（内置子集已覆盖常用 UI 字符） |
+| 升级后黑屏/无法启动 | 断电重启；仍异常则切换回原固件 |
+| 插件安装提示失败 | 重试一次；提示"已安装"即成功 |
+| 打不开章节 | 确认已连 Wi-Fi |
+| 中文字体发虚/缺字 | 放入 fonts/ 字体后重新安装升级 |
+| 设备无响应 | 断电重启 |
 
-## 六、开发者
-
-### 构建
+## 构建（开发者）
 
 ```bash
-pio run -e murphy_m4
-# 产物：.pio/build/murphy_m4/firmware.bin
+pio run -e murphy_m4     # 产物：.pio/build/murphy_m4/firmware.bin
 ```
 
-第三方依赖由 PlatformIO `lib_deps` 拉取；本仓库不包含 vendor 的第三方库源码与内置字体数据（内置 CJK 字体可用 `lib/EpdFont/scripts/fontconvert.py` 重新生成）。
-
-### 项目结构
-
-- `src/` — 固件主源码（AppRuntime、LuaHost、阅读器、网络、安装器）
-- `lib/` — 自研组件库（字体/渲染、TXT 解析、文件系统封装等）
-- `scripts/` — 刷写/调试工具（m4adb、APP1 安全刷写脚本）
+源码结构：`src/`（固件主源码）、`lib/`（自研组件）、`scripts/`（刷写/调试工具）。
 
 ## License
 
