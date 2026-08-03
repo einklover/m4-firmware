@@ -1,0 +1,17 @@
+**/__pycache__/
+*.pyc
+.pio/
+artifacts/fonts/release/*.epdfont
+artifacts/fonts/source/
+backups/
+build/
+artifacts/
+# Local IDE / runtime (do not commit)
+compile_commands.json
+sdcard/
+.DS_Store
+# m4adb local cache / serial captures (never commit packages or secrets)
+build/m4adb/
+*.session.json
+**/session.json
+simulator/build*/
