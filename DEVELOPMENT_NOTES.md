@@ -1,3 +1,12 @@
+## 发布 2026-08-04 (firmware sha256 651f22bd…)
+
+- 固件: 双 UA 头修复 (net.request/dl.jsonGet/jsonToFile), dl 回调墙钟预算扩展,
+  QRCodeHelper 自动选版 (V4 超容损坏修复), validJsonShape 允许空 path (正文 file_out).
+- 插件:
+  - weread.m4x v0.6.8
+  - fanqie.m4x v0.2.17
+  - jjwxc.m4x v0.1.0 (晋江文学: 分类浏览/目录/免费章/VIP章扫码登录阅读)
+
 # Murphy M4 开发踩坑全量手册
 
 > 汇总自全部历史开发文档（docs/ 34 篇 + task_prompts/ 14 篇 + 实战记录），覆盖硬件、刷写、SD 卡、网络、Lua 沙箱、阅读器、并发、字体、安全等全部主题。接手开发者先读 TOP 15，再按分类查细节。
