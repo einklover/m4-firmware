@@ -80,6 +80,10 @@ class MappedInputManager {
   mutable int swipeSx = 0, swipeSy = 0, swipeEx = 0, swipeEy = 0;
   // Synthetic Back for global edge-back → button path
   mutable bool syntheticBack = false;
+  // Preserve touch duration after the release event is consumed.
+  mutable bool touchHeldOverrideValid = false;
+  mutable unsigned long touchHeldOverrideMs = 0;
+  mutable unsigned long touchHeldOverrideAt = 0;
 
 #if defined(CROSSPOINT_MURPHY_M4)
   enum class SynthKind : uint8_t { None, Tap, Key };
@@ -94,6 +98,7 @@ class MappedInputManager {
 
   bool mapButton(Button button, bool (HalGPIO::*fn)(uint8_t) const) const;
   bool decodeSwipe(int& sx, int& sy, int& ex, int& ey) const;
+  void rememberTouchHeldTime() const;
   bool listItemFromPoint(int x, int y, int& index, int itemCount, int selectedIndex, int listTop, int listHeight,
                          bool hasSubtitle) const;
 };

@@ -377,9 +377,9 @@ inline bool fullScreenDismissFromPoint(int px, int py, int screenW, int screenH)
 // System navigation gestures (phone-like full-screen)
 // ---------------------------------------------------------------------------
 // Navigation gestures are edge-originating gestures, not generic swipes:
-// Back starts at the right edge and moves left; Home starts at the bottom edge
-// and moves up. Keeping the activation bands narrow prevents reader page turns
-// from being interpreted as navigation.
+// Back accepts either edge: left-to-right or right-to-left. Home starts at the
+// bottom edge and moves up. Narrow activation bands keep ordinary reader page
+// turns out of system navigation.
 constexpr float kBackEdgeFracX = 0.12f;  // rightmost 12% of screen
 constexpr float kHomeEdgeFracY = 0.08f;  // bottom 8% of screen
 constexpr int kNavGestureMinPx = 56;
@@ -393,9 +393,10 @@ inline bool isSystemBackSwipe(int sx, int sy, int ex, int ey, int screenW, int s
   if (screenW <= 0) return false;
   const int dx = ex - sx;
   const int dy = ey - sy;
-  if (dx >= -kNavGestureMinPx) return false;
+  if (absInt(dx) < kNavGestureMinPx) return false;
   if (absInt(dx) < absInt(dy) * kNavGestureAxisRatio) return false;
-  return sx >= screenW - static_cast<int>(screenW * kBackEdgeFracX);
+  const int edge = static_cast<int>(screenW * kBackEdgeFracX);
+  return (sx <= edge && dx > 0) || (sx >= screenW - edge && dx < 0);
 }
 
 inline bool isSystemHomeSwipe(int sx, int sy, int ex, int ey, int screenW, int screenH) {

@@ -1138,7 +1138,7 @@ void loop() {
   }
 
   // Global full-screen navigation gestures (all activities):
-  //   • right-edge swipe left → Back (synthetic button so every page responds)
+  //   • edge swipe (either direction) → Back (synthetic button so every page responds)
   //   • bottom-edge swipe up  → Home
   mappedInputManager.beginFrame();
 #ifdef CROSSPOINT_MURPHY_M4
@@ -1146,9 +1146,10 @@ void loop() {
     if (!currentActivity->isHomeActivity() && mappedInputManager.wasHomeGesture()) {
       Serial.printf("[%lu] [M4-GESTURE] home (bottom swipe up)\n", millis());
       onGoHome();
-      // Home activity entered; skip previous activity loop this frame.
+      // Home activity entered; never run the old activity again this frame.
+      return;
     } else if (!currentActivity->isHomeActivity() && mappedInputManager.wasBackGesture()) {
-      Serial.printf("[%lu] [M4-GESTURE] back (right-edge swipe left)\n", millis());
+      Serial.printf("[%lu] [M4-GESTURE] back (edge swipe)\n", millis());
       // Pulse logical Back so button paths and wasBackGesture both see it.
       mappedInputManager.pulseSyntheticBack();
     }
