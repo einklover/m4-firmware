@@ -81,6 +81,7 @@ class M4xLuaHost {
   // Cooperative ContentProvider prefetch while native reader owns the panel.
   // Calls global provider_pump_work() if present; never paints.
   bool callProviderPump(std::string& errorOut);
+  bool loaderNeedsPump() const;
 
   // Accessed by Lua C bindings in M4xLuaHost.cpp
   GfxRenderer* renderer_ = nullptr;

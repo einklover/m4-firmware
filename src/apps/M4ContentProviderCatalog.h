@@ -28,6 +28,17 @@ inline bool fieldAt(const std::string& line, int field0, std::string& out) {
   return false;
 }
 
+// Native TOC only shows title text; plugins (jjwxc) store VIP as a side field.
+// When vipField0 is set and the cell is non-zero / non-"false", prefix "VIP ".
+inline void decorateTitleWithVip(const std::string& line, int vipField0, std::string& title) {
+  if (vipField0 < 0 || title.empty()) return;
+  std::string flag;
+  if (!fieldAt(line, vipField0, flag) || flag.empty()) return;
+  if (flag == "0" || flag == "false" || flag == "nil" || flag == "False") return;
+  if (title.find("VIP") != std::string::npos) return;
+  title.insert(0, "VIP ");
+}
+
 inline bool resolveRow(M4FileRows::FileRowSource& source,
                        const M4ContentProvider::ChapterCatalogSpec& catalog, int index0,
                        M4ContentProvider::ChapterMeta& out, std::string& errorOut,

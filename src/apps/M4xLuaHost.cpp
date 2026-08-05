@@ -7,6 +7,7 @@
 #include "apps/M4xHttpBodyReader.h"
 #include "apps/M4xHostIo.h"
 #include "apps/M4xJsonStream.h"
+#include "apps/M4xProgressiveLoader.h"
 #include "apps/M4UiStyleAdapter.h"
 #include "apps/M4xLuaSandbox.h"
 #include "apps/M4ContentProviderCatalog.h"
@@ -3870,6 +3871,295 @@ int l_dl_jsonToFile(lua_State* L) {
   return 1;
 }
 
+// ---- loader: progressive chapter/toc (URL + extract → early native handoff) ----
+
+static void readHeaderMap(lua_State* L, int idx, std::vector<std::pair<std::string, std::string>>& out) {
+  lua_getfield(L, idx, "headers");
+  if (lua_istable(L, -1)) {
+    lua_pushnil(L);
+    while (lua_next(L, -2) != 0) {
+      if (lua_isstring(L, -2) && lua_isstring(L, -1)) {
+        out.emplace_back(lua_tostring(L, -2), lua_tostring(L, -1));
+      }
+      lua_pop(L, 1);
+    }
+  }
+  lua_pop(L, 1);
+}
+
+static void readStringPath(lua_State* L, int idx, const char* key, std::vector<std::string>& out) {
+  lua_getfield(L, idx, key);
+  if (lua_istable(L, -1)) {
+    const size_t n = static_cast<size_t>(lua_rawlen(L, -1));
+    for (size_t i = 1; i <= n; ++i) {
+      lua_rawgeti(L, -1, static_cast<int>(i));
+      if (lua_isstring(L, -1)) out.emplace_back(lua_tostring(L, -1));
+      lua_pop(L, 1);
+    }
+  }
+  lua_pop(L, 1);
+}
+
+int l_loader_chapter(lua_State* L) {
+  auto* h = hostFromLua(L);
+  if (!h) return luaL_error(L, "no host");
+  if (!lua_istable(L, 1)) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "params_required");
+    return 2;
+  }
+  M4xProgressiveLoader::ChapterSpec spec;
+  lua_getfield(L, 1, "url");
+  spec.url = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "out");
+  spec.relOut = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+  lua_pop(L, 1);
+  readHeaderMap(L, 1, spec.headers);
+  lua_getfield(L, 1, "extract");
+  if (lua_istable(L, -1)) {
+    lua_getfield(L, -1, "kind");
+    const char* kind = lua_isstring(L, -1) ? lua_tostring(L, -1) : "json_field";
+    lua_pop(L, 1);
+    if (kind && std::strcmp(kind, "raw") == 0) {
+      spec.rawBody = true;
+    } else {
+      readStringPath(L, -1, "path", spec.jsonPath);  // relative to extract table: wrong index
+    }
+    lua_getfield(L, -1, "field");
+    if (lua_isstring(L, -1)) spec.field = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    // path inside extract
+    lua_getfield(L, -1, "path");
+    if (lua_istable(L, -1)) {
+      spec.jsonPath.clear();
+      const size_t n = static_cast<size_t>(lua_rawlen(L, -1));
+      for (size_t i = 1; i <= n; ++i) {
+        lua_rawgeti(L, -1, static_cast<int>(i));
+        if (lua_isstring(L, -1)) spec.jsonPath.emplace_back(lua_tostring(L, -1));
+        lua_pop(L, 1);
+      }
+    }
+    lua_pop(L, 1);
+  } else {
+    // Shorthand: field at top level
+    lua_getfield(L, 1, "field");
+    if (lua_isstring(L, -1)) spec.field = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    readStringPath(L, 1, "path", spec.jsonPath);
+    if (spec.field.empty()) spec.field = "content";
+  }
+  lua_pop(L, 1);
+  if (spec.field.empty() && !spec.rawBody) spec.field = "content";
+
+  lua_getfield(L, 1, "early_bytes");
+  if (lua_isnumber(L, -1)) spec.earlyBytes = static_cast<size_t>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "max_bytes");
+  if (lua_isnumber(L, -1)) spec.maxBytes = static_cast<size_t>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "timeout_ms");
+  if (lua_isnumber(L, -1)) spec.timeoutMs = static_cast<uint32_t>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "follow_redirects");
+  if (lua_isboolean(L, -1)) spec.followRedirects = lua_toboolean(L, -1);
+  lua_pop(L, 1);
+
+  auto getStr = [&](const char* k) -> const char* {
+    lua_getfield(L, 1, k);
+    const char* s = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+    lua_pop(L, 1);
+    return s ? s : "";
+  };
+  spec.open.title = getStr("title");
+  spec.open.bookId = getStr("bookId");
+  spec.open.chapterUid = getStr("chapterUid");
+  spec.open.progressKey = getStr("progressKey");
+  spec.open.providerId = getStr("providerId");
+  spec.open.appId = h->app_.id;
+  lua_getfield(L, 1, "chapterIndex");
+  if (lua_isnumber(L, -1)) spec.open.chapterIndex = static_cast<int>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "initialByteOffset");
+  if (lua_isnumber(L, -1)) {
+    spec.open.initialByteOffset = static_cast<uint64_t>(lua_tointeger(L, -1));
+    spec.open.hasInitialByteOffset = true;
+  }
+  lua_pop(L, 1);
+  spec.open.generation = M4PluginReaderSession::bumpGeneration();
+  spec.open.relPath = spec.relOut;
+
+  if (spec.url.empty() || spec.relOut.empty() || !M4xNetPolicy::isAllowedUrl(spec.url.c_str())) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "bad_params");
+    return 2;
+  }
+  if (M4PluginReaderBridge::resolveUnderDataRoot(h->dataDir().c_str(), spec.relOut.c_str(), spec.absOut) !=
+      M4PluginReaderBridge::OpenError::Ok) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "bad_path");
+    return 2;
+  }
+  h->extendCallbackWallMs(spec.timeoutMs + 5000);
+  std::string err;
+  if (!M4xProgressiveLoader::session().beginChapter(std::move(spec), err)) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, err.c_str());
+    return 2;
+  }
+  // Do NOT prime many pumps here: connect + body used to freeze the e-ink
+  // loading screen for seconds with no progress. Host/plugin pump between
+  // draws so status bytes/phase can refresh. Tiny chapters still open on the
+  // next few Tick/draw pumps (earlyBytes default ~1.5KB).
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int l_loader_toc(lua_State* L) {
+  auto* h = hostFromLua(L);
+  if (!h) return luaL_error(L, "no host");
+  if (!lua_istable(L, 1)) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "params_required");
+    return 2;
+  }
+  M4xProgressiveLoader::TocSpec spec;
+  lua_getfield(L, 1, "url");
+  spec.url = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "out");
+  spec.relOut = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+  lua_pop(L, 1);
+  readHeaderMap(L, 1, spec.headers);
+  readStringPath(L, 1, "path", spec.jsonPath);
+  lua_getfield(L, 1, "fields");
+  if (lua_istable(L, -1)) {
+    const size_t n = static_cast<size_t>(lua_rawlen(L, -1));
+    for (size_t i = 1; i <= n; ++i) {
+      lua_rawgeti(L, -1, static_cast<int>(i));
+      if (lua_isstring(L, -1)) spec.fields.emplace_back(lua_tostring(L, -1));
+      lua_pop(L, 1);
+    }
+  }
+  lua_pop(L, 1);
+  if (spec.fields.empty()) {
+    spec.fields = {"chapterid", "chaptername", "chaptertype", "isvip", "islock"};
+  }
+  if (spec.jsonPath.empty()) spec.jsonPath = {"chapterlist"};
+
+  lua_getfield(L, 1, "early_rows");
+  if (lua_isnumber(L, -1)) spec.earlyRows = static_cast<size_t>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "max_bytes");
+  if (lua_isnumber(L, -1)) spec.maxBytes = static_cast<size_t>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "timeout_ms");
+  if (lua_isnumber(L, -1)) spec.timeoutMs = static_cast<uint32_t>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "follow_redirects");
+  if (lua_isboolean(L, -1)) spec.followRedirects = lua_toboolean(L, -1);
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "uidField");
+  if (lua_isnumber(L, -1)) spec.uidField0 = static_cast<int>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "titleField");
+  if (lua_isnumber(L, -1)) spec.titleField0 = static_cast<int>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, 1, "vipField");
+  if (lua_isnumber(L, -1)) spec.vipField0 = static_cast<int>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+
+  auto getStr = [&](const char* k) -> const char* {
+    lua_getfield(L, 1, k);
+    const char* s = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+    lua_pop(L, 1);
+    return s ? s : "";
+  };
+  spec.open.bookId = getStr("bookId");
+  spec.open.bookTitle = getStr("title");
+  spec.open.providerId = getStr("providerId");
+  spec.open.appId = h->app_.id;
+  spec.open.appDataRoot = h->dataDir();
+  lua_getfield(L, 1, "currentIndex");
+  if (lua_isnumber(L, -1)) spec.open.currentIndex = static_cast<int>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  spec.open.generation = M4PluginReaderSession::bumpGeneration();
+
+  if (spec.url.empty() || spec.relOut.empty() || !M4xNetPolicy::isAllowedUrl(spec.url.c_str())) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "bad_params");
+    return 2;
+  }
+  if (M4PluginReaderBridge::resolveUnderDataRoot(h->dataDir().c_str(), spec.relOut.c_str(), spec.absOut) !=
+      M4PluginReaderBridge::OpenError::Ok) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "bad_path");
+    return 2;
+  }
+  h->extendCallbackWallMs(spec.timeoutMs + 5000);
+  std::string err;
+  if (!M4xProgressiveLoader::session().beginToc(std::move(spec), err)) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, err.c_str());
+    return 2;
+  }
+  // No multi-pump prime (same reason as chapter): keep loading UI responsive.
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int l_loader_pump(lua_State* L) {
+  uint32_t budgetMs = 100;
+  size_t budgetBytes = 16 * 1024;
+  if (lua_istable(L, 1)) {
+    lua_getfield(L, 1, "ms");
+    if (lua_isnumber(L, -1)) budgetMs = static_cast<uint32_t>(lua_tointeger(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "bytes");
+    if (lua_isnumber(L, -1)) budgetBytes = static_cast<size_t>(lua_tointeger(L, -1));
+    lua_pop(L, 1);
+  }
+  auto* h = hostFromLua(L);
+  // Connecting (TLS) can take several seconds; body slices stay short.
+  if (h) h->extendCallbackWallMs(budgetMs + 8000);
+  const bool more = M4xProgressiveLoader::session().pump(budgetMs, budgetBytes);
+  lua_pushboolean(L, more ? 1 : 0);
+  return 1;
+}
+
+int l_loader_status(lua_State* L) {
+  const auto st = M4xProgressiveLoader::session().status();
+  lua_newtable(L);
+  lua_pushboolean(L, st.active ? 1 : 0);
+  lua_setfield(L, -2, "active");
+  lua_pushstring(L, st.kind == M4xProgressiveLoader::Kind::Chapter
+                        ? "chapter"
+                        : (st.kind == M4xProgressiveLoader::Kind::Toc ? "toc" : "none"));
+  lua_setfield(L, -2, "kind");
+  lua_pushstring(L, st.phaseName ? st.phaseName : "idle");
+  lua_setfield(L, -2, "phase");
+  lua_pushnumber(L, static_cast<lua_Number>(st.bytes));
+  lua_setfield(L, -2, "bytes");
+  lua_pushnumber(L, static_cast<lua_Number>(st.rows));
+  lua_setfield(L, -2, "rows");
+  lua_pushboolean(L, st.early ? 1 : 0);
+  lua_setfield(L, -2, "early");
+  lua_pushboolean(L, st.done ? 1 : 0);
+  lua_setfield(L, -2, "done");
+  lua_pushstring(L, st.error ? st.error : "");
+  lua_setfield(L, -2, "error");
+  lua_pushstring(L, st.path ? st.path : "");
+  lua_setfield(L, -2, "path");
+  return 1;
+}
+
+int l_loader_cancel(lua_State* L) {
+  (void)L;
+  M4xProgressiveLoader::session().cancel();
+  return 0;
+}
+
+
 int l_dl_download(lua_State* L) {
   auto* h = hostFromLua(L);
   if (!h) return luaL_error(L, "no host");
@@ -4343,6 +4633,16 @@ bool M4xLuaHost::start(GfxRenderer& renderer, const M4xInstalledApp& app, std::s
   };
   registerModule(L, "dl", dlRegs);
 
+  static const luaL_Reg loaderRegs[] = {
+      {"chapter", l_loader_chapter},
+      {"toc", l_loader_toc},
+      {"pump", l_loader_pump},
+      {"status", l_loader_status},
+      {"cancel", l_loader_cancel},
+      {nullptr, nullptr},
+  };
+  registerModule(L, "loader", loaderRegs);
+
   lua_pushnumber(L, 0);
   lua_setglobal(L, "COLOR_WHITE");
   lua_pushnumber(L, 1);
@@ -4527,6 +4827,9 @@ bool M4xLuaHost::callOnTocClosed(bool cancelled, int chapterIndex0, const char* 
 }
 
 bool M4xLuaHost::callProviderPump(std::string& errorOut) {
+  if (M4xProgressiveLoader::session().needsPump()) {
+    M4xProgressiveLoader::session().pump(120, 24 * 1024);
+  }
   if (!L_) return true;
   auto* L = static_cast<lua_State*>(L_);
   lua_getglobal(L, "provider_pump_work");
@@ -4537,6 +4840,10 @@ bool M4xLuaHost::callProviderPump(std::string& errorOut) {
   lua_pop(L, 1);
   // Longer wall: may include one network hop + SD write for prefetch.
   return callGlobal(L, &budget_, "provider_pump_work", 0, M4xLuaSandbox::kDefaultWallMs * 4, errorOut);
+}
+
+bool M4xLuaHost::loaderNeedsPump() const {
+  return M4xProgressiveLoader::session().needsPump();
 }
 
 void M4xLuaHost::stop() {

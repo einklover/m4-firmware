@@ -110,7 +110,7 @@ void AppRuntimeActivity::handleEventOnOwner(const M4xRuntime::Event& e) {
       if (subActivity) {
         // Still allow cooperative Lua work without painting: chapter prefetch
         // and history-reopen TOC/session restore (provider_pump_work is idle-cheap).
-        if (pluginChildKind_ == PluginChildKind::Reader) {
+        if (pluginChildKind_ == PluginChildKind::Reader || host_.loaderNeedsPump()) {
           std::string pumpErr;
           if (!host_.callProviderPump(pumpErr) && !host_.isCancelRequested()) {
             Serial.printf("[WRCP] provider_pump err=%s\n", pumpErr.c_str());
@@ -334,7 +334,7 @@ void AppRuntimeActivity::runtimeTaskMain() {
             subActivity && pluginChildKind_ == PluginChildKind::Reader &&
             M4ContentProviderSession::pendingWorkCount() > 0;
         const uint32_t idleMs =
-            (host_.wantsPump() || providerBusy) ? kPumpIdleDrawMs : kIdleDrawMs;
+            (host_.wantsPump() || providerBusy || host_.loaderNeedsPump()) ? kPumpIdleDrawMs : kIdleDrawMs;
         if (millis() - lastDrawMs >= idleMs) {
           handleEventOnOwner(M4xRuntime::Event::makeTick());
           lastDrawMs = millis();
