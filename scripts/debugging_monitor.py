@@ -2,6 +2,8 @@ import sys
 import argparse
 import re
 import threading
+import subprocess
+from pathlib import Path
 from datetime import datetime
 from collections import deque
 import time
@@ -95,57 +97,52 @@ def parse_memory_line(line):
 
 def serial_worker(port, baud):
     """
-    Runs in a background thread. Handles reading serial, printing to console,
-    and updating the data lists.
+    Runs in a background thread. Reads the device log stream through the
+    m4adb daemon socket (never opens the USB port directly), prints to
+    console, and updates the data lists.
     """
-    print(f"{Fore.CYAN}--- Opening {port} at {baud} baud ---{Style.RESET_ALL}")
+    m4adb_py = Path(__file__).resolve().parent / "m4adb.py"
+    print(f"{Fore.CYAN}--- Reading log via m4adb daemon (port={port}) ---{Style.RESET_ALL}")
+
+    cmd = [sys.executable, str(m4adb_py)]
+    if port:
+        cmd += ["--port", port]
+    cmd += ["logs"]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace"
+    )
 
     try:
-        ser = serial.Serial(port, baud, timeout=0.1)
-        ser.dtr = False
-        ser.rts = False
-    except serial.SerialException as e:
-        print(f"{Fore.RED}Error opening port: {e}{Style.RESET_ALL}")
-        return
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
 
-    try:
-        while True:
-            try:
-                raw_data = ser.readline().decode('utf-8', errors='replace')
+            # m4adb logs prints "HH:MM:SS <raw line>"; reuse the raw line
+            raw_line = re.sub(r"^\d{2}:\d{2}:\d{2} ", "", line)
 
-                if not raw_data:
-                    continue
+            # Add PC timestamp
+            pc_time = datetime.now().strftime("%H:%M:%S")
+            formatted_line = re.sub(r"^\[\d+\]", f"[{pc_time}]", raw_line)
 
-                clean_line = raw_data.strip()
-                if not clean_line:
-                    continue
+            # Check for Memory Line
+            if "[MEM]" in formatted_line:
+                free_val, total_val = parse_memory_line(formatted_line)
+                if free_val is not None:
+                    with data_lock:
+                        time_data.append(pc_time)
+                        free_mem_data.append(free_val / 1024) # Convert to KB
+                        total_mem_data.append(total_val / 1024) # Convert to KB
 
-                # Add PC timestamp
-                pc_time = datetime.now().strftime("%H:%M:%S")
-                formatted_line = re.sub(r"^\[\d+\]", f"[{pc_time}]", clean_line)
+            # Print to console
+            line_color = get_color_for_line(formatted_line)
+            print(f"{line_color}{formatted_line}")
 
-                # Check for Memory Line
-                if "[MEM]" in formatted_line:
-                    free_val, total_val = parse_memory_line(formatted_line)
-                    if free_val is not None:
-                        with data_lock:
-                            time_data.append(pc_time)
-                            free_mem_data.append(free_val / 1024) # Convert to KB
-                            total_mem_data.append(total_val / 1024) # Convert to KB
-
-                # Print to console
-                line_color = get_color_for_line(formatted_line)
-                print(f"{line_color}{formatted_line}")
-
-            except OSError:
-                print(f"{Fore.RED}Device disconnected.{Style.RESET_ALL}")
-                break
-    except Exception as e:
-        # If thread is killed violently (e.g. main exit), silence errors
-        pass
+    except (OSError, BrokenPipeError):
+        print(f"{Fore.RED}Device disconnected.{Style.RESET_ALL}")
     finally:
-        if 'ser' in locals() and ser.is_open:
-            ser.close()
+        if proc.poll() is None:
+            proc.terminate()
 
 def update_graph(frame):
     """
