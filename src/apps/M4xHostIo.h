@@ -31,8 +31,13 @@ inline const char* permissionError(const Permissions& p, Operation op) {
 }
 
 struct Limits {
+  // jsonGet buffers the whole body (PSRAM when present) before projecting
+  // rows into Lua.  The 192KiB hard cap rejected large shelf/catalog
+  // responses (WeRead shelf with 200+ books → "response_too_large"); the Lua
+  // heap headroom check after projection is the real guard, so allow large
+  // bodies up to the stream cap.  Default stays small for unstated requests.
   static constexpr size_t kJsonGetDefault = 160 * 1024;
-  static constexpr size_t kJsonGetHard = 192 * 1024;
+  static constexpr size_t kJsonGetHard = 4 * 1024 * 1024;
   static constexpr size_t kStreamDefault = 768 * 1024;
   static constexpr size_t kStreamHard = 4 * 1024 * 1024;
   static constexpr uint32_t kTimeoutDefaultMs = 30000;

@@ -469,6 +469,18 @@ void AppRuntimeActivity::tryLaunchPluginReader() {
 
   Serial.printf("[WR05] t=%lu launch_begin gen=%u path=%s\n", static_cast<unsigned long>(millis()),
                 static_cast<unsigned>(req.generation), req.relPath.c_str());
+  if (req.pendingComplete) {
+    // Loader early-open: the chapter body is still streaming into the file.
+    // Show a loading placeholder instead of paginating the partial body; a
+    // second open (pendingComplete=false) arrives when the body is complete.
+    M4PluginReaderSession::clearLaunchInProgress();
+    renderer.clearScreen();
+    M4UiText::drawCentered(renderer, UI_12_FONT_ID, 220, "加载中…", true, EpdFontFamily::BOLD);
+    M4UiText::drawCentered(renderer, UI_10_FONT_ID, 280, req.title.c_str());
+    renderer.displayBuffer();
+    postEvent(M4xRuntime::Event::makeDraw());
+    return;
+  }
   const uint32_t handoffStartedMs = millis();
   const uint32_t tLoad0 = millis();
   auto txt = std::make_unique<Txt>(req.absPath, "/.crosspoint");

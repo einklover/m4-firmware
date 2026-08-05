@@ -94,6 +94,11 @@ struct OpenRequest {
   int chapterIndex = 0;  // 0-based index in toc.json (current chapter)
   // Optional ContentProvider id (e.g. "weread") — never a filesystem path.
   std::string providerId;
+  // Early loader open: the chapter body is still streaming into the file.
+  // The receiver shows a loading placeholder instead of paginating the
+  // partial file; a second open (pendingComplete=false) arrives when the
+  // body is complete.
+  bool pendingComplete = false;
 };
 
 inline OpenError validateMeta(const char* title, const char* bookId, const char* chapterUid,

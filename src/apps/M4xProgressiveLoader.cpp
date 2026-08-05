@@ -594,6 +594,10 @@ void Session::maybeEarlyChapter() {
   if (sink_) sink_->forceFlush();
   chapter_.open.relPath = relOut_;
   chapter_.open.absPath = absOut_;
+  // Early open: body still streaming. Mark pendingComplete so the native
+  // reader shows a loading placeholder instead of paginating the partial
+  // file; a final open (pendingComplete=false) follows in finishOk.
+  chapter_.open.pendingComplete = !streamComplete_;
   if (!M4PluginReaderSession::queueOpen(chapter_.open)) {
     // Keep streaming; plugin may retry open.
     return;
@@ -665,6 +669,17 @@ void Session::finishOk() {
     } else if (kind_ == Kind::Toc) {
       earlyThreshold_ = 0;
       maybeEarlyToc();
+    }
+  } else if (kind_ == Kind::Chapter && streamComplete_) {
+    // Early open showed a loading placeholder; body is now complete.
+    // Re-open without pendingComplete so the reader paginates the full file.
+    chapter_.open.relPath = relOut_;
+    chapter_.open.absPath = absOut_;
+    chapter_.open.pendingComplete = false;
+    if (M4PluginReaderSession::queueOpen(chapter_.open)) {
+#if defined(ARDUINO_ARCH_ESP32)
+      Serial.printf("[LOADER] final_open bytes=%u\n", static_cast<unsigned>(bytes_));
+#endif
     }
   }
   streamComplete_ = true;

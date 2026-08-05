@@ -3481,7 +3481,8 @@ int l_dl_jsonGet(lua_State* L) {
     lua_pushstring(L, "bad_params");
     return 2;
   }
-  const size_t cap = M4xHostIo::Limits::bodyCap(maxBytes, M4xHostIo::Operation::JsonGet);
+  const size_t cap = std::min(M4xHostIo::Limits::bodyCap(maxBytes, M4xHostIo::Operation::JsonGet),
+                              netMaxBodyBytes());
   const uint32_t safeTimeout = M4xHostIo::Limits::timeoutMs(timeoutMs);
 
   // Stream response into a PSRAM-backed buffer.
