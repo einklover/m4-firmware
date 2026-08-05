@@ -2465,6 +2465,13 @@ void pushJsonVariant(lua_State* L, JsonVariantConst v) {
   }
 }
 
+// Defined below with the ESP32 PSRAM allocator; keeping the declaration here
+// lets the generic Lua JSON helper use the same off-chip working memory as
+// dl.jsonGet instead of silently consuming the scarce internal heap.
+#if defined(ARDUINO_ARCH_ESP32)
+static ArduinoJson::Allocator* PsramJsonAllocatorInstance();
+#endif
+
 int l_json_decode(lua_State* L) {
   size_t len = 0;
   const char* s = luaL_checklstring(L, 1, &len);
@@ -2487,7 +2494,13 @@ int l_json_decode(lua_State* L) {
     }
   }
   // Dynamic document; capacity ~ body (ArduinoJson 7 grows).
-  JsonDocument doc;
+  JsonDocument doc(
+#if defined(ARDUINO_ARCH_ESP32)
+      PsramJsonAllocatorInstance()
+#else
+      ArduinoJson::detail::DefaultAllocator::instance()
+#endif
+  );
   const DeserializationError err = deserializeJson(doc, s, len);
   if (err) {
     lua_pushnil(L);
@@ -3161,10 +3174,44 @@ class SdTransactionBackend final : public M4xHostIo::TransactionBackend {
 
 class TransactionJsonSink final : public M4xJsonStream::Sink {
  public:
-  explicit TransactionJsonSink(M4xHostIo::TransactionalWriter& writer) : writer_(writer) {}
-  bool write(const uint8_t* data, size_t len) override { return writer_.write(data, len); }
+  explicit TransactionJsonSink(M4xHostIo::TransactionalWriter& writer) : writer_(writer) {
+#if defined(ARDUINO_ARCH_ESP32)
+    buffer_ = static_cast<uint8_t*>(heap_caps_malloc(kBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#endif
+  }
+  ~TransactionJsonSink() override {
+#if defined(ARDUINO_ARCH_ESP32)
+    if (buffer_) heap_caps_free(buffer_);
+#endif
+  }
+  bool write(const uint8_t* data, size_t len) override {
+    if (!data && len) return false;
+    while (len) {
+      if (!buffer_ || len >= kBufferBytes) {
+        if (!flush() || !writer_.write(data, len)) return false;
+        return true;
+      }
+      const size_t n = std::min(len, kBufferBytes - used_);
+      std::memcpy(buffer_ + used_, data, n);
+      used_ += n;
+      data += n;
+      len -= n;
+      if (used_ == kBufferBytes && !flush()) return false;
+    }
+    return true;
+  }
+  bool flush() {
+    if (!used_) return true;
+    if (!buffer_ || !writer_.write(buffer_, used_)) return false;
+    used_ = 0;
+    return true;
+  }
+
  private:
+  static constexpr size_t kBufferBytes = 16 * 1024;
   M4xHostIo::TransactionalWriter& writer_;
+  uint8_t* buffer_ = nullptr;
+  size_t used_ = 0;
 };
 
 class NetworkBodySource final : public M4xHostIo::StreamSource {
@@ -3797,6 +3844,10 @@ int l_dl_jsonToFile(lua_State* L) {
     err = M4xJsonStream::errorString(extractor.error());
     fail = true;
   }
+  if (!fail && !sink.flush()) {
+    err = "sd_write_failed";
+    fail = true;
+  }
   if (!fail && !writer.commit()) {
     err = "sd_commit_failed";
     fail = true;
@@ -4160,7 +4211,8 @@ bool M4xLuaHost::start(GfxRenderer& renderer, const M4xInstalledApp& app, std::s
 
   clearCancel();
   budget_ = M4xLuaSandbox::Budget{};
-  budget_.memLimit = M4xLuaSandbox::kDefaultHeapLimit;
+  budget_.memLimit = psramFound() ? M4xLuaSandbox::kPsramHeapLimit
+                                  : M4xLuaSandbox::kDefaultHeapLimit;
   budget_.instrBudget = M4xLuaSandbox::kDefaultInstrBudget;
   budget_.nowMs = &hostNowMs;
   budget_.cancelFlag = &cancelRequested_;

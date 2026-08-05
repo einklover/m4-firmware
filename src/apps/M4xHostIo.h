@@ -72,7 +72,11 @@ struct Limits {
 
   static bool validJsonShape(const std::vector<std::string>& path,
                              const std::vector<std::string>& fields) {
-    if (path.empty() || path.size() > kMaxPathDepth || fields.empty() || fields.size() > kMaxFields) {
+    // An empty path addresses the JSON root object.  This is required for
+    // APIs such as Jinjiang chapterContent whose response is
+    // {"content":"..."}, rather than an array nested under a named key.
+    // Keep fields mandatory so callers cannot request an unbounded projection.
+    if (path.size() > kMaxPathDepth || fields.empty() || fields.size() > kMaxFields) {
       return false;
     }
     for (const auto& p : path) if (p.empty() || p.size() > kMaxNameBytes) return false;

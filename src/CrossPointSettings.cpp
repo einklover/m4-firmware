@@ -929,6 +929,11 @@ int CrossPointSettings::getReaderFontId() const {
 
   if (fontFamily == FONT_CUSTOM) {
     uint8_t targetSize = customFontSize;
+    // 0 is automatic; reject values below the supported TTF rasterizer size.
+    // This also protects settings written through the web API or old files.
+    if (targetSize != 0) {
+      targetSize = std::max<uint8_t>(12, std::min<uint8_t>(48, targetSize));
+    }
     if (targetSize == 0) {
       switch (fontSize) {
         case SMALL:

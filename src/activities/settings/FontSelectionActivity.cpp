@@ -24,7 +24,7 @@ void FontSelectionActivity::onEnter() {
   Serial.println("[FSA] onEnter start");
   Activity::onEnter();
   FontManager::getInstance().invalidateScan();
-  fontFamilies = FontManager::getInstance().getAvailableFamilies();
+  fontFamilies = FontManager::getInstance().getAvailableTtfFamilies();
   Serial.printf("[FSA] Got %d families\n", fontFamilies.size());
 
   std::string current = SETTINGS.customFontFamily;
@@ -178,8 +178,7 @@ void FontSelectionActivity::render() const {
     const int boxW = screenW - 2 * boxPadding;
     const int lineH = renderer.getLineHeight(UI_10_FONT_ID);
     const int lineSpacing = 8;
-    const char* lines[] = {L(Str::kPleaseVisit), "Copy to SD:", "/fonts/NotoSansCJKsc.epdfont",
-                           L(Str::kCopyToFontsDir)};
+    const char* lines[] = {L(Str::kPleaseVisit), "Copy to SD:", "/FONT/*.ttf", L(Str::kCopyToFontsDir)};
     constexpr int lineCount = 4;
     const int boxH = lineCount * lineH + (lineCount - 1) * lineSpacing + 24;
     const int boxX = boxPadding;

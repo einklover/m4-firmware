@@ -3077,7 +3077,10 @@ void TxtReaderActivity::renderPage(bool skipDisplay, int xOffset, bool skipInver
     const int effectiveLeft = orientedMarginLeft + xOffset;
     const int lineXStart = effectiveLeft;
     const int lineXEnd = effectiveLeft + viewportWidth;
-    const int textHeight = renderer.getLineHeight(cachedFontId);
+    // Underline is relative to the baseline, not to the full line advance.
+    // TTF line advance includes descender/leading, so using it here places
+    // the underline inside the following line when line compression is tight.
+    const int underlineBase = renderer.getFontAscenderSize(cachedFontId);
 
     int y = orientedMarginTop;
     for (size_t lineIdx = 0; lineIdx < currentPageLines.size(); lineIdx++) {
@@ -3220,7 +3223,8 @@ void TxtReaderActivity::renderPage(bool skipDisplay, int xOffset, bool skipInver
 
         // 绘制行下划线（与 EPUB PageLine::render 一致）
         if (showExtraLine) {
-          int lineY = y + textHeight + underlineOffset;
+          const int nextLineY = y + std::max(0, static_cast<int>(std::ceil(lineHeight)) - 1);
+          int lineY = std::min(y + underlineBase + underlineOffset, nextLineY);
           drawDashedLine(lineXStart, lineY, lineXEnd, dashLength, gapLength);
         }
       }

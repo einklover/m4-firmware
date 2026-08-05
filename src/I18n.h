@@ -89,6 +89,7 @@
   STR(kIconSelectedStyle,       "图标选中风格",      "圖標選中風格") \
   /* --- 阅读设置项名称 --- */ \
   STR(kFontSize,                "字号",              "字號") \
+  STR(kValAuto,                 "自动",              "自動") \
   STR(kFirstLineIndent,         "首行缩进",          "首行縮進") \
   STR(kLineSpacing,             "行间距",            "行間距") \
   STR(kWordSpacing,             "字间距",            "字間距") \
@@ -346,7 +347,7 @@
   STR(kSelectFont,             "选择字体",          "選擇字體") \
   STR(kPleaseVisit,            "请访问",            "請訪問") \
   STR(kGenerateEpdFont,        "生成.epdfont格式的字体", "生成.epdfont格式的字體") \
-  STR(kCopyToFontsDir,         "拷贝到内存卡/fonts目录下", "拷貝到內存卡/fonts目錄下") \
+  STR(kCopyToFontsDir,         "拷贝到内存卡/FONT目录下", "拷貝到內存卡/FONT目錄下") \
   STR(kConfirmShort,           "确定",              "確定") \
   STR(kConfigCalibreOpds,      "配置calibre的OPDS服务器地址和认证信息", "配置calibre的OPDS服務器地址和認證信息") \
   STR(kCompleted,             "已完成",            "已完成") \

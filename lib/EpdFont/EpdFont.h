@@ -22,4 +22,9 @@ class EpdFont {
                                          const EpdFontStyles::Style style = EpdFontStyles::REGULAR) const;
 
   virtual const EpdFontData* getData(const EpdFontStyles::Style style = EpdFontStyles::REGULAR) const { return data; }
+
+  // Type tag so owners can identify the runtime TTF backend without RTTI
+  // (murphy_m4 builds with -fno-rtti). Used by FontManager to release TTF
+  // bitmap caches on font switch.
+  virtual bool isRuntimeTtf() const { return false; }
 };

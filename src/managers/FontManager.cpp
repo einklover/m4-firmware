@@ -8,6 +8,18 @@
 
 #include "CustomEpdFont.h"
 #include "FontCacheManager.h"
+#include "TtfEpdFont.h"
+
+namespace {
+constexpr const char* kLegacyEpdFontDir = "/fonts";
+constexpr const char* kRuntimeTtfDir = "/FONT";
+
+bool isTtfName(const String& name) {
+  String n = name;
+  n.toLowerCase();
+  return n.endsWith(".ttf");
+}
+}  // namespace
 
 FontManager& FontManager::getInstance() {
   static FontManager instance;
@@ -26,6 +38,19 @@ void FontManager::clearLoadedFonts() {
   // 注意：不 delete EpdFontFamily/EpdFont 指针，因为 GfxRenderer::fontMap
   // 中仍持有 EpdFontFamily 的值拷贝，其内部的 EpdFont* 指向同一对象。
   // 少量内存泄漏（几百字节），在嵌入式设备上可接受（字体切换是低频操作）。
+  // TTF 后端例外：释放其位图缓存，避免多尺寸实例的 PSRAM 累积。
+  for (auto& familyPair : loadedFonts) {
+    for (auto& sizePair : familyPair.second) {
+      if (EpdFontFamily* fam = sizePair.second) {
+        if (const EpdFont* font = fam->getFont(EpdFontFamily::REGULAR)) {
+          if (font->isRuntimeTtf()) {
+            const TtfEpdFont* ttf = static_cast<const TtfEpdFont*>(font);
+            const_cast<TtfEpdFont*>(ttf)->clearCaches();
+          }
+        }
+      }
+    }
+  }
   loadedFonts.clear();
 }
 
@@ -36,34 +61,41 @@ const std::vector<std::string>& FontManager::getAvailableFamilies() {
   return availableFamilies;
 }
 
+const std::vector<std::string>& FontManager::getAvailableTtfFamilies() {
+  if (!scanned) {
+    scanFonts();
+  }
+  return availableTtfFamilies;
+}
+
 void FontManager::scanFonts() {
   Serial.println("[FM] Scanning fonts...");
   availableFamilies.clear();
+  availableTtfFamilies.clear();
   scanned = true;
 
-  FsFile fontDir;
-  if (!SdMan.openFileForRead("FontScan", "/fonts", fontDir)) {
-    Serial.println("[FM] Failed to open /fonts directory");
-    // Even if failed, we proceed to sort empty list to avoid crashes
-    return;
-  }
+  auto scanDir = [&](const char* dirPath, bool allowLegacyEpdFont) {
+    FsFile fontDir;
+    if (!SdMan.openFileForRead("FontScan", dirPath, fontDir)) {
+      Serial.printf("[FM] Failed to open %s directory\n", dirPath);
+      return;
+    }
+    if (!fontDir.isDirectory()) {
+      Serial.printf("[FM] %s is not a directory\n", dirPath);
+      fontDir.close();
+      return;
+    }
 
-  if (!fontDir.isDirectory()) {
-    Serial.println("[FM] /fonts is not a directory");
-    fontDir.close();
-    return;
-  }
+    Serial.printf("[FM] %s opened. Iterating files...\n", dirPath);
+    FsFile file;
+    while (file.openNext(&fontDir, O_READ)) {
+      if (!file.isDirectory()) {
+        char filename[128];
+        file.getName(filename, sizeof(filename));
+        Serial.printf("[FM] Checking %s/%s\n", dirPath, filename);
 
-  Serial.println("[FM] /fonts opened. Iterating files...");
-  FsFile file;
-  while (file.openNext(&fontDir, O_READ)) {
-    if (!file.isDirectory()) {
-      char filename[128];
-      file.getName(filename, sizeof(filename));
-      Serial.printf("[FM] Checking: %s\n", filename);
-
-      String name = String(filename);
-      if (name.endsWith(".epdfont")) {
+        String name = String(filename);
+        if (allowLegacyEpdFont && name.endsWith(".epdfont")) {
         // Use the full filename (minus .epdfont extension) as the font name
         String fontName = name.substring(0, name.length() - 8);
 
@@ -74,11 +106,27 @@ void FontManager::scanFonts() {
             Serial.printf("[FM] Added font: %s\n", fontName.c_str());
           }
         }
+        } else if (isTtfName(name)) {
+        // Runtime TrueType: the family name is the full .ttf filename, so the
+        // settings/UI surfaces expose the real file the user dropped on SD.
+        if (std::find(availableFamilies.begin(), availableFamilies.end(), name.c_str()) ==
+            availableFamilies.end()) {
+          availableFamilies.push_back(name.c_str());
+          availableTtfFamilies.push_back(name.c_str());
+          Serial.printf("[FM] Added TTF font: %s\n", name.c_str());
+        }
       }
+      }
+      file.close();
     }
-    file.close();
-  }
-  fontDir.close();
+    fontDir.close();
+  };
+
+  // Legacy generated bitmap fonts stay in /fonts for internal compatibility.
+  scanDir(kLegacyEpdFontDir, true);
+  // User-provided runtime TrueType files live in the device's documented
+  // uppercase FONT directory.
+  scanDir(kRuntimeTtfDir, false);
 
   std::sort(availableFamilies.begin(), availableFamilies.end());
   Serial.printf("[FM] Scan complete. Found %d families\n", availableFamilies.size());
@@ -526,6 +574,26 @@ static EpdFont* loadFontFile(const String& path) {
 EpdFontFamily* FontManager::getCustomFontFamily(const std::string& familyName, int fontSize) {
   if (loadedFonts[familyName][fontSize]) {
     return loadedFonts[familyName][fontSize];
+  }
+
+  const bool isTtf = isTtfName(String(familyName.c_str()));
+
+  if (isTtf) {
+    // Runtime TrueType: streamed glyf rasterizer, no flash caching. The TTF is
+    // per (family, size) so changing customFontSize re-instantiates the face.
+    String fontPath = String(kRuntimeTtfDir) + "/" + String(familyName.c_str());
+    Serial.printf("[FontMgr] Loading TTF font: %s @%dpx\n", fontPath.c_str(), fontSize);
+
+    TtfEpdFont* regular = new (std::nothrow) TtfEpdFont(fontPath, (uint16_t)fontSize);
+    if (regular && regular->valid()) {
+      EpdFontFamily* fontFamily = new EpdFontFamily(regular, nullptr, nullptr, nullptr);
+      loadedFonts[familyName][fontSize] = fontFamily;
+      return fontFamily;
+    }
+    const char* err = regular ? regular->lastError() : "alloc failed";
+    Serial.printf("[FontMgr] Failed to load TTF font: %s (%s)\n", fontPath.c_str(), err);
+    delete regular;
+    return nullptr;
   }
 
   // familyName 即字体列表中显示的完整名称（文件名去掉 .epdfont 后缀）

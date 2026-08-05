@@ -115,7 +115,15 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
 
   // 1) Explicit CUSTOM family → reader hash IDs only (no UI promotion unless canonical).
   if (!d.loadCustomFamily.empty()) {
-    const int sizes[] = {12, 14, 16, 18};
+    std::vector<int> sizes = {12, 14, 16, 18, 20, 24};
+    // Runtime TTF: honor the exact customFontSize (12..48) so the reader's
+    // getReaderFontId() customFontSize branch resolves to a loaded id.
+    const uint8_t explicitSize = SETTINGS.customFontSize == 0
+                                     ? 0
+                                     : std::max<uint8_t>(12, std::min<uint8_t>(48, SETTINGS.customFontSize));
+    if (explicitSize != 0 && std::find(sizes.begin(), sizes.end(), explicitSize) == sizes.end()) {
+      sizes.push_back(explicitSize);
+    }
     bool any = false;
     for (int sz : sizes) {
       any = (loadAndInsertCustom(renderer, d.loadCustomFamily.c_str(), sz, loadedCustomIds) >= 0) || any;

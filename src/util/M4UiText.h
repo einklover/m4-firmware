@@ -1,19 +1,18 @@
 #pragma once
 
-// Unified UI text face for Murphy M4.  Chrome text must be rendered by the
-// compact built-in UI face: a user-selected reader font is allowed to omit
-// common UI glyphs, which otherwise turns labels into '?' even though the
-// firmware has the glyph.  Reader/content views still use SETTINGS' reader
-// face through the dedicated reader APIs.
+// Unified UI text face for Murphy M4. UI and reader content share the selected
+// TTF family, but UI uses fixed cached face sizes independent of reader size.
 //
 // Pure policy: M4UiTextPolicy.h (host-testable).
 // Drawing helpers: this header (device / sim with GfxRenderer).
 
 #include <GfxRenderer.h>
 #include <EpdFontFamily.h>
+#include <EpdFontLoader.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
 
 #include "CrossPointSettings.h"
@@ -21,6 +20,13 @@
 #include "util/M4UiTextPolicy.h"
 
 namespace M4UiText {
+
+// UI sizes are independent from the reader size and are loaded into the same
+// glyph cache as the reader faces. The slightly larger source faces compensate
+// for the compact built-in UI metrics without a post-rasterization scale.
+inline int uiTtfSizeForLayout(int layoutFontId) {
+  return layoutFontId == UI_10_FONT_ID ? 20 : 24;
+}
 
 // Runtime resolve against GfxRenderer + SETTINGS reader id.
 inline Face resolve(const GfxRenderer& renderer, int layoutFontId) {
@@ -35,11 +41,18 @@ inline Face resolve(const GfxRenderer& renderer, int layoutFontId) {
 inline Face resolveForText(const GfxRenderer& renderer, int layoutFontId, const char* text,
                            EpdFontFamily::Style style = EpdFontFamily::REGULAR) {
   Face f = resolve(renderer, layoutFontId);
-  const int reader = SETTINGS.getReaderFontId();
-  if (reader != 0 && reader != -1 && renderer.hasFont(reader) &&
-      renderer.hasTextGlyphs(reader, text ? text : "", style)) {
-    f.fontId = reader;
-    f.scale = renderer.scaleFontToMatch(reader, f.layoutFontId);
+  if (SETTINGS.fontFamily != CrossPointSettings::FONT_CUSTOM ||
+      strlen(SETTINGS.customFontFamily) == 0) {
+    return f;
+  }
+
+  // Use a fixed cached face for chrome, so changing reader size does not
+  // change menu/button text and no runtime bitmap scaling is needed.
+  const int uiFont = EpdFontLoader::getBestFontId(
+      SETTINGS.customFontFamily, uiTtfSizeForLayout(f.layoutFontId));
+  if (uiFont != -1 && renderer.hasFont(uiFont) &&
+      renderer.hasTextGlyphs(uiFont, text ? text : "", style)) {
+    f.fontId = uiFont;
   }
   return f;
 }
