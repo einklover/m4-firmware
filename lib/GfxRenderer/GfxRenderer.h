@@ -172,6 +172,10 @@ class GfxRenderer {
 
   // Low level functions
   uint8_t* getFrameBuffer() const;
+  // Access a stored previous-frame chunk (page-turn animation source).
+  const uint8_t* bwBufferChunk(size_t i) const {
+    return (i < BW_BUFFER_NUM_CHUNKS) ? bwBufferChunks[i] : nullptr;
+  }
   static size_t getBufferSize();
     //透明壁纸
   void drawPngFromTxtpng(const char* txtpng_file_path) const ;

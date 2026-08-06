@@ -309,6 +309,12 @@ void Bridge::poll() {
     if (b < 0) break;
     feedByte(static_cast<char>(b));
   }
+  // Pump the async Waveform Lab animation one step per loop so the main
+  // loop (and its watchdog) never blocks for the whole animation.
+  if (M4WaveformLab::animateActive()) {
+    uint32_t stepMs = 0;
+    M4WaveformLab::pumpAnimateWindow(stepMs);
+  }
   if (shotActive_) pollScreenshot();
 }
 
@@ -619,16 +625,57 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
     replyOk(reqId, "{\"op\":\"lut_set_frames\",\"ok\":true}", true);
     return;
   }
-  if (strcmp(op, "lut_animate") == 0) {
+  if (strcmp(op, "lut_settle") == 0) {
     const char* prev = doc["prev"] | "";
     const char* next = doc["next"] | "";
-    const int steps = doc["steps"] | 6;
-    const int feather = doc["feather"] | 12;
     if (!prev[0] || !next[0]) {
       replyErr(reqId, "bad_path", "prev/next 路径必填");
       return;
     }
-    const uint32_t ms = M4WaveformLab::runAnimate(prev, next, steps, feather);
+    const uint32_t ms = M4WaveformLab::runSettle(prev, next);
+    if (ms == 0) {
+      replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
+      return;
+    }
+    char out[96];
+    snprintf(out, sizeof(out), "{\"op\":\"lut_settle\",\"ok\":true,\"ms\":%u}",
+             static_cast<unsigned>(ms));
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_wipe") == 0) {
+    const char* prev = doc["prev"] | "";
+    const char* next = doc["next"] | "";
+    const int steps = doc["steps"] | 4;
+    if (!prev[0] || !next[0]) {
+      replyErr(reqId, "bad_path", "prev/next 路径必填");
+      return;
+    }
+    const uint32_t ms = M4WaveformLab::runAnimateWindow(prev, next, steps);
+    if (ms == 0) {
+      replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
+      return;
+    }
+    char out[128];
+    snprintf(out, sizeof(out), "{\"op\":\"lut_wipe\",\"ok\":true,\"ms\":%u,\"steps\":%d}",
+             static_cast<unsigned>(ms), steps);
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_animate") == 0) {
+    const char* prev = doc["prev"] | "";
+    const char* next = doc["next"] | "";
+    const int steps = doc["steps"] | 6;
+    const int feather = doc["feather"] | 0;
+    const uint32_t tailMs = doc["tail_ms"] | 0;
+    const int dir = doc["dir"] | 0;
+    if (!prev[0] || !next[0]) {
+      replyErr(reqId, "bad_path", "prev/next 路径必填");
+      return;
+    }
+    // Synchronous full-frame synthesis animation (blocking; the loop stays
+    // inside poll for the animation duration — verified stable on device).
+    const uint32_t ms = M4WaveformLab::runAnimate(prev, next, steps, feather, tailMs, dir);
     if (ms == 0) {
       replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
       return;
@@ -671,13 +718,14 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
   }
   if (strcmp(op, "lut_stats") == 0) {
     const auto s = M4WaveformLab::stats();
-    char out[160];
+    const bool anim = M4WaveformLab::animateActive();
+    char out[200];
     snprintf(out, sizeof(out),
              "{\"op\":\"lut_stats\",\"ok\":true,\"last_ms\":%u,\"runs\":%u,\"lut_set\":%s,"
-             "\"active\":%s,\"frames_ready\":%s}",
+             "\"active\":%s,\"frames_ready\":%s,\"animating\":%s}",
              static_cast<unsigned>(s.lastRunMs), static_cast<unsigned>(s.runs),
              s.lutSet ? "true" : "false", s.active ? "true" : "false",
-             s.framesReady ? "true" : "false");
+             s.framesReady ? "true" : "false", anim ? "true" : "false");
     replyOk(reqId, out);
     return;
   }

@@ -39,6 +39,9 @@ struct Stats {
 // Call from the debug bridge.  Returns a JSON error key or nullptr on success.
 // `display` must be the live HalDisplay (NULL when not available).
 void setDisplay(HalDisplay* display);
+// Directly set the experiment LUT from a 110-byte buffer (voltage tail
+// locked to the safe factory values).  Returns false on bad length.
+bool setLutBytes(const uint8_t* lut, size_t len);
 bool beginFrameUpload(int slot);
 uint8_t* frameSlot(int slot);          // nullptr when slot not ready
 bool frameUploadComplete(int slot);    // size matched
@@ -51,11 +54,36 @@ bool setSdFrames(const char* prevPath, const char* nextPath);
 // Establish the physical baseline: FULL-refresh the panel to the given SD
 // frame so subsequent FAST differential runs start from a known state.
 bool baselineFromSd(const char* framePath);
-// On-device computed wipe animation: read prev/next from SD into PSRAM, then
-// synthesize `steps` intermediate frames (new page enters from the right,
-// feather px dithered edge) and refresh each with the current LUT.
-// Returns total ms, or 0 on failure. steps==0 disables animation.
-uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int feather);
+// Kindle-style multipass wipe (full-frame):
+//   each step: RED = original page1, BW = composeWipe(page1, page2, edge)
+// Covered region keeps being driven page1→page2 every step (ink settles);
+// uncovered stays page1. New page enters from the right; `feather` dithers
+// the edge. Returns total ms, or 0 on failure.
+uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int feather, uint32_t tailMs,
+                    int dir);
+// In-memory page-turn animation: old/new are full physical frames (48000B,
+// 0=black 1=white) already in RAM (e.g. renderer.frameBuffer).  Runs the
+// same multipass wipe as runAnimate but without SD access.  Returns ms.
+uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int steps, int feather,
+                       uint32_t tailMs, int dir);
+// Window multipass: each step refreshes the entire covered region [edge, W]
+// with RED=page1 / BW=page2 (re-drives already-wiped strips). Less early-step
+// SPI than full-frame. Returns total ms or 0.
+uint32_t runAnimateWindow(const char* prevPath, const char* nextPath, int steps);
+// Async animation session: start once, then pump one step per call from the
+// main loop (never block the loop for the whole animation — blocking starves
+// the watchdog).  pump returns false when the session is finished/failed.
+bool startAnimateWindow(const char* prevPath, const char* nextPath, int steps);
+// Generic async animation start (mode chosen by windowMode: false = full-frame
+// synthesis, true = window strips).
+bool startAnimate(const char* prevPath, const char* nextPath, int steps, int feather, bool windowMode);
+bool pumpAnimateWindow(uint32_t& stepMsOut);
+bool animateActive();
+// Post-animation settle: full-frame RED=oldPage, BW=newPage with the current
+// LUT (a stronger multi-phase waveform) so every changed pixel gets one more
+// directional drive — clears residual old content, deepens new ink, and
+// leaves O==N pixels untouched. Returns ms or 0.
+uint32_t runSettle(const char* prevPath, const char* nextPath);
 bool setLut(const uint8_t* lut, size_t len, bool unlockVoltages);
 uint32_t runRefresh(bool swapAfter);   // returns last run ms (0 on failure)
 void clearAll();                       // safe full refresh + reset state

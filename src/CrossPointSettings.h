@@ -285,6 +285,20 @@ class CrossPointSettings {
   // 关机前全刷：1=每次关机前清屏全刷，0=直接关机不清屏
   uint8_t sleepBeforeFullRefresh = 1;
 
+  // --- 翻页动画（PageTurnAnimation）---
+  // 总开关：1=开启翻页动画，0=关闭（默认关闭，传统瞬时翻页）
+  uint8_t pageTurnAnimationEnabled = 0;
+  // 动画步数（2..32，默认 9）
+  uint8_t pageTurnAnimationSteps = 9;
+  // 波形 TP 值（0x01..0x10，默认 0x02）
+  uint8_t pageTurnAnimationTp = 0x02;
+  // 帧率（0x22/0x44/0x88，默认 0x88）
+  uint8_t pageTurnAnimationFrameRate = 0x88;
+  // 尾刷时长（单位 100ms，0=关，默认 10=1000ms）
+  uint8_t pageTurnAnimationTailMs = 10;
+  // 翻页方向：0=右→左，1=左→右，2=下→上，3=上→下（默认 0）
+  uint8_t pageTurnAnimationDir = 0;
+
   // 图片渲染质量：0=普通(1-bit BW+dithering)，1=高清(2-bit 4阶灰度)
   enum IMAGE_QUALITY { QUALITY_FAST = 0, QUALITY_NORMAL = 1, QUALITY_HD = 2 };
   uint8_t imageQuality = QUALITY_NORMAL;

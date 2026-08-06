@@ -225,7 +225,17 @@ def main() -> None:
     p.add_argument("prev")
     p.add_argument("next")
     p.add_argument("--steps", type=int, default=6)
-    p.add_argument("--feather", type=int, default=12)
+    p.add_argument("--feather", type=int, default=0)
+    p.add_argument("--tail", type=int, default=0, help="ghost-clear tail ms (0=off)")
+    p.add_argument("--dir", type=int, default=0,
+                   help="0=right->left, 1=left->right, 2=bottom->top, 3=top->bottom")
+    p = sub.add_parser("wipewin")
+    p.add_argument("prev")
+    p.add_argument("next")
+    p.add_argument("--steps", type=int, default=4)
+    p = sub.add_parser("settle")
+    p.add_argument("prev")
+    p.add_argument("next")
     p = sub.add_parser("lut")
     p.add_argument("--hex", help="comma/space separated 105+ bytes (waveform first)")
     p.add_argument("--unlock", action="store_true", help="allow voltage bytes to pass through")
@@ -272,7 +282,23 @@ def main() -> None:
         animate(c, args)
     elif args.cmd == "wipe":
         r = c.request({"op": "lut_animate", "prev": args.prev, "next": args.next,
-                       "steps": args.steps, "feather": args.feather}, timeout=120)
+                       "steps": args.steps, "feather": args.feather,
+                       "tail_ms": args.tail, "dir": args.dir}, timeout=120)
+        print(json.dumps(r, ensure_ascii=False))
+    elif args.cmd == "wipewin":
+        r = c.request({"op": "lut_wipe", "prev": args.prev, "next": args.next,
+                       "steps": args.steps}, timeout=120)
+        print(json.dumps(r, ensure_ascii=False))
+    elif args.cmd == "settle":
+        r = c.request({"op": "lut_settle", "prev": args.prev, "next": args.next}, timeout=120)
+        print(json.dumps(r, ensure_ascii=False))
+    elif args.cmd == "touch":
+        if args.off:
+            r = c.request({"op": "lut_touch", "on": False}, timeout=15)
+        else:
+            r = c.request({"op": "lut_touch", "on": True, "page_a": args.page_a,
+                           "page_b": args.page_b, "steps": args.steps,
+                           "tail_ms": args.tail}, timeout=15)
         print(json.dumps(r, ensure_ascii=False))
     elif args.cmd == "run":
         r = c.request({"op": "lut_run", "swap": args.swap}, timeout=30)

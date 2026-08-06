@@ -98,6 +98,13 @@ bool CrossPointSettings::saveToFile() const {
   doc["transparentOverlayPxc"]     = transparentOverlayPxc;
   doc["sleepPngInvert"]            = sleepPngInvert;
   doc["sleepBeforeFullRefresh"]    = sleepBeforeFullRefresh;
+  // Page-turn animation
+  doc["pageTurnAnimationEnabled"]    = pageTurnAnimationEnabled;
+  doc["pageTurnAnimationSteps"]      = pageTurnAnimationSteps;
+  doc["pageTurnAnimationTp"]         = pageTurnAnimationTp;
+  doc["pageTurnAnimationFrameRate"]  = pageTurnAnimationFrameRate;
+  doc["pageTurnAnimationTailMs"]     = pageTurnAnimationTailMs;
+  doc["pageTurnAnimationDir"]        = pageTurnAnimationDir;
   // Power & system
   doc["shortPwrBtn"]               = shortPwrBtn;
   doc["sleepTimeout"]              = sleepTimeout;
@@ -726,6 +733,13 @@ bool CrossPointSettings::loadFromFile() {
           getString("transparentOverlayPxc", transparentOverlayPxc, sizeof(transparentOverlayPxc));
           sleepPngInvert           = doc["sleepPngInvert"]           | (uint8_t)1;
           sleepBeforeFullRefresh   = doc["sleepBeforeFullRefresh"]   | (uint8_t)1;
+          // Page-turn animation
+          pageTurnAnimationEnabled   = doc["pageTurnAnimationEnabled"]   | (uint8_t)0;
+          pageTurnAnimationSteps     = doc["pageTurnAnimationSteps"]     | (uint8_t)9;
+          pageTurnAnimationTp        = doc["pageTurnAnimationTp"]        | (uint8_t)0x02;
+          pageTurnAnimationFrameRate = doc["pageTurnAnimationFrameRate"] | (uint8_t)0x88;
+          pageTurnAnimationTailMs    = doc["pageTurnAnimationTailMs"]    | (uint8_t)10;
+          pageTurnAnimationDir       = doc["pageTurnAnimationDir"]       | (uint8_t)0;
           // Power & system
           shortPwrBtn              = doc["shortPwrBtn"]              | (uint8_t)PAGE_TURN;
           sleepTimeout             = doc["sleepTimeout"]             | (uint8_t)SLEEP_10_MIN;

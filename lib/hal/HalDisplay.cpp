@@ -87,3 +87,8 @@ uint32_t HalDisplay::waveformLabRefresh(const uint8_t* prev, const uint8_t* next
 void HalDisplay::waveformLabBaseline(const uint8_t* frame) {
   einkDisplay.waveformLabBaseline(frame);
 }
+
+uint32_t HalDisplay::waveformLabRefreshWindow(const uint8_t* prev, const uint8_t* next, const uint8_t* lut,
+                                              uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  return einkDisplay.waveformLabRefreshWindow(prev, next, lut, x, y, w, h);
+}

@@ -20,6 +20,8 @@
 #include "util/M4PluginTidxCodec.h"
 #include "util/M4PluginReaderStatePolicy.h"
 #include "util/M4ProgressiveTxtIndex.h"
+#include "debug/M4WaveformLab.h"
+#include <HalDisplay.h>
 #include "util/M4ContentProviderContract.h"
 #include "util/M4HistoryReopen.h"
 #include "apps/M4ContentProviderSession.h"
@@ -3272,6 +3274,51 @@ void TxtReaderActivity::renderPage(bool skipDisplay, int xOffset, bool skipInver
 
 void TxtReaderActivity::finishPhysicalDisplay() {
   // Runs WITHOUT renderingMutex. Framebuffer already has BW layout from renderPage.
+  // Page-turn animation: when enabled, play a wipe between the previous page
+  // (stored BW chunks) and the newly rendered frame instead of a direct
+  // displayBuffer.  The animation blocks this task (~2.5s) — acceptable for
+  // the demo; the main loop stays free.
+  if (SETTINGS.pageTurnAnimationEnabled != 0) {
+    const uint8_t* newFrame = renderer.getFrameBuffer();
+    if (newFrame != nullptr) {
+      // Assemble the previous page from stored BW chunks if available.
+      constexpr size_t chunkBytes = HalDisplay::BUFFER_SIZE / 12;
+      constexpr size_t numChunks = 12;
+      uint8_t* oldFrame = static_cast<uint8_t*>(heap_caps_malloc(HalDisplay::BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+      bool haveOld = false;
+      if (oldFrame) {
+        haveOld = true;
+        for (size_t c = 0; c < numChunks; ++c) {
+          const uint8_t* src = renderer.bwBufferChunk(c);
+          if (!src) { haveOld = false; break; }
+          std::memcpy(oldFrame + c * chunkBytes, src, chunkBytes);
+        }
+      }
+      if (haveOld) {
+        const int dir = SETTINGS.pageTurnAnimationDir;
+        extern HalDisplay display;
+        M4WaveformLab::setDisplay(&display);
+        // Rebuild the experiment LUT from the current settings.
+        uint8_t lut[110] = {};
+        lut[10] = 0x80; lut[20] = 0x40;               // 01 / 10 drive
+        lut[50] = static_cast<uint8_t>(SETTINGS.pageTurnAnimationTp & 0xFF);
+        lut[51] = 0x01;
+        for (int i = 100; i < 105; ++i) lut[i] = static_cast<uint8_t>(SETTINGS.pageTurnAnimationFrameRate & 0xFF);
+        lut[105] = 0x17; lut[106] = 0x41; lut[107] = 0xA8; lut[108] = 0x32; lut[109] = 0x30;
+        M4WaveformLab::setLutBytes(lut, sizeof(lut));
+        M4WaveformLab::runAnimateMem(oldFrame, newFrame, SETTINGS.pageTurnAnimationSteps,
+                                     /*feather=*/0,
+                                     static_cast<uint32_t>(SETTINGS.pageTurnAnimationTailMs) * 100,
+                                     dir);
+        free(oldFrame);
+        physicalEpdBusy_ = false;
+        pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+        renderer.storeBwBuffer();  // new page becomes the next old page
+        return;
+      }
+      if (oldFrame) free(oldFrame);
+    }
+  }
   if (automaticPageTurnActive && rollingMode) {
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     if (pagesUntilFullRefresh > 0) pagesUntilFullRefresh--;

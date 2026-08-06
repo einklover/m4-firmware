@@ -25,6 +25,20 @@ def socket_path_for_port(port: str) -> Path:
     return Path("/tmp") / f"m4adb-{digest}.sock"
 
 
+def serial_port_alive(transport) -> bool:
+    """Probe whether the underlying serial port still responds.  A transient
+    e-ink refresh stall keeps the port open (in_waiting works, read may be
+    empty); a removed/unplugged device raises immediately."""
+    try:
+        ser = getattr(transport, "_ser", None)
+        if ser is None:
+            return False
+        _ = ser.in_waiting
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class DaemonTransport:
     """Transport implementation backed by a local daemon Unix socket."""
 
@@ -170,8 +184,13 @@ class BridgeDaemon:
                     data = self.serial.read(0.01)
                     if data and self.peer is not None:
                         self.peer.sendall(data.encode("utf-8", errors="replace"))
-                except (ConnectionError, OSError):
-                    self._close_peer()
+                except (ConnectionError, OSError) as exc:
+                    # The e-ink main loop can block USB CDC briefly during a
+                    # long refresh; a transient read error must NOT kill the
+                    # peer (that looks like "daemon disconnected" mid-animation).
+                    # Only give up when the device is really gone.
+                    if not serial_port_alive(self.serial):
+                        self._close_peer()
         except Exception as exc:  # pragma: no cover - exercised on real host
             print(f"m4adb daemon error: {exc}", file=sys.stderr, flush=True)
             return 1

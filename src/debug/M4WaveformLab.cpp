@@ -51,6 +51,11 @@ uint8_t* allocSlot() {
 
 void setDisplay(HalDisplay* display) { gDisplay = display; }
 
+bool setLutBytes(const uint8_t* lut, size_t len) {
+  if (!lut || len < 105) return false;
+  return setLut(lut, len, /*unlockVoltages=*/false);
+}
+
 bool beginFrameUpload(int slot) {
   if (gRunning) return false;
   if (slot < 0 || slot > 1) return false;
@@ -175,44 +180,108 @@ namespace {
 // `feather` px around the edge use a sparse dithered transition so the slide
 // reads smooth instead of a dense checkered fence.  edge>=W: full new page;
 // edge<=0: full old page.
-void composeWipe(const uint8_t* old, const uint8_t* newFrame, uint8_t* out, int edge, int feather,
-                 int widthBytes, int height) {
+// dir: 0=right->left (new page enters from right), 1=left->right,
+//      2=bottom->top (new page enters from bottom), 3=top->bottom.
+void composeWipeDir(const uint8_t* old, const uint8_t* newFrame, uint8_t* out, int edge, int feather,
+                    int widthBytes, int height, int dir) {
   const int W = widthBytes * 8;
-  if (edge >= W) {
-    // Full old page: the wipe edge has not started moving yet.
-    std::memcpy(out, old, static_cast<size_t>(widthBytes) * height);
-    return;
-  }
+  const int H = height;
+  const bool horiz = (dir == 0 || dir == 1);
+  const int span = horiz ? W : H;
+  // When the edge has fully swept, the whole frame is the new page.
   if (edge <= 0) {
-    // Full new page: the wipe is complete.
     std::memcpy(out, newFrame, static_cast<size_t>(widthBytes) * height);
     return;
   }
-  for (int row = 0; row < height; ++row) {
+  if (edge >= span) {
+    std::memcpy(out, old, static_cast<size_t>(widthBytes) * height);
+    return;
+  }
+  for (int row = 0; row < H; ++row) {
     const int rowOff = row * widthBytes;
     for (int x = 0; x < W; ++x) {
       int v = 0;
       const int bx = x / 8;
       const int bit = 0x80 >> (x % 8);
-      if (x < edge - feather) {
-        v = (old[rowOff + bx] & bit) ? 1 : 0;
-      } else if (x >= edge) {
-        v = (newFrame[rowOff + bx] & bit) ? 1 : 0;
+      int pos;
+      if (horiz) {
+        pos = (dir == 0) ? x : (W - 1 - x);
       } else {
-        // Sparse blend: every 2nd column samples the new page inside the
-        // band; the rest keep the old page -> soft edge, no dense fence.
-        const int d = x - (edge - feather);
-        v = ((d & 1) == 0) ? (((newFrame[rowOff + bx] & bit) ? 1 : 0))
-                           : (((old[rowOff + bx] & bit) ? 1 : 0));
+        pos = (dir == 2) ? row : (H - 1 - row);
+      }
+      const uint8_t* src = (pos < edge - feather) ? old : ((pos >= edge) ? newFrame : nullptr);
+      if (src != nullptr) {
+        v = (src[rowOff + bx] & bit) ? 1 : 0;
+      } else {
+        // Sparse blend inside the feather band.
+        const int d = pos - (edge - feather);
+        const uint8_t* s = ((d & 1) == 0) ? newFrame : old;
+        v = (s[rowOff + bx] & bit) ? 1 : 0;
       }
       if (v) out[rowOff + bx] |= bit;
     }
   }
 }
 
+void composeWipe(const uint8_t* old, const uint8_t* newFrame, uint8_t* out, int edge, int feather,
+                 int widthBytes, int height) {
+  composeWipeDir(old, newFrame, out, edge, feather, widthBytes, height, /*dir=*/0);
+}
+
 }  // namespace
 
-uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int feather) {
+uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int steps, int feather,
+                       uint32_t tailMs, int dir) {
+  if (!gDisplay || gRunning) return 0;
+  if (!gLutSet) return 0;
+  if (!oldFrame || !newFrame) return 0;
+  if (steps < 1) steps = 1;
+  if (steps > 64) steps = 64;
+  if (feather < 0) feather = 0;
+  if (feather > 64) feather = 64;
+  uint8_t* cur = allocSlot();
+  if (!cur) return 0;
+  uint8_t* spare = allocSlot();
+  if (!spare) {
+    free(cur);
+    return 0;
+  }
+  const int W = 800;
+  const int wb = W / 8;
+  const int H = 480;
+  const uint32_t t0 = millis();
+  gRunning = true;
+  // Same multipass wipe as runAnimate: RED stays the ORIGINAL old frame,
+  // BW is the composed wipe (old left / new right), covered region re-drives
+  // every step so ink keeps settling.  oldFrame/newFrame must stay valid for
+  // the duration (they are the renderer's frame buffer).
+  for (int i = 1; i <= steps; ++i) {
+    std::memset(cur, 0, kFrameBytes);
+    const int span = (dir == 0 || dir == 1) ? W : H;
+    const int edge = span - (span * i) / steps;
+    composeWipeDir(oldFrame, newFrame, cur, edge, feather, wb, H, dir);
+    gDisplay->waveformLabRefresh(oldFrame, cur, gLut, /*turnOff=*/false);
+    delay(2);
+  }
+  if (tailMs > 0) {
+    uint32_t target = tailMs;
+    if (target > 10000) target = 10000;
+    const uint32_t tailStart = millis();
+    int tail = 0;
+    while (tail < 12 && (millis() - tailStart) < target) {
+      gDisplay->waveformLabRefresh(oldFrame, newFrame, gLut, /*turnOff=*/false);
+      ++tail;
+      delay(2);
+    }
+  }
+  free(cur);
+  free(spare);
+  gRunning = false;
+  return millis() - t0;
+}
+
+uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int feather, uint32_t tailMs,
+                    int dir) {
   if (!gDisplay || gRunning) return 0;
   if (!gLutSet) return 0;
   if (steps < 1) steps = 1;
@@ -221,7 +290,7 @@ uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int f
   if (feather > 64) feather = 64;
   if (!readFrameIntoSlot(prevPath, 0)) return 0;
   if (!readFrameIntoSlot(nextPath, 1)) return 0;
-  // Third buffer for the synthesized intermediate frame.
+  // BW plane buffer for the composed wipe frame (RED stays original page1).
   uint8_t* synth = allocSlot();
   if (!synth) return 0;
 
@@ -230,34 +299,185 @@ uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int f
   const int H = 480;
   const uint32_t t0 = millis();
   gRunning = true;
-  // Baseline: the panel currently shows prev (host should have FULL-cleared to
-  // prev first, but be safe: run a FAST diff from prev to prev = no-op).
-  // Then each step refreshes prev->synth with the animation LUT.
+  // Kindle-style multipass wipe:
+  //   RED  = original page1 every step (never the previous synth)
+  //   BW   = composeWipe(page1, page2, edge)
+  // Covered region (x >= edge): RED=page1 ≠ BW=page2 → drives EVERY step,
+  // so already-wiped ink keeps settling ("变重") instead of one-shot freeze.
+  // Uncovered region (x < edge): RED=BW=page1 → idle.
+  // Intermediate frames always come from the ORIGINAL prev/next — never chain
+  // synth→synth (that accumulates blend error / ghosting).
   for (int i = 1; i <= steps; ++i) {
     std::memset(synth, 0, kFrameBytes);
-    // New page enters from the right: the edge starts at W and sweeps left
-    // to 0.  (x >= edge => new page, so edge must DECREASE over steps.)
-    const int edge = W - (W * i) / steps;
-    composeWipe(gSlot[0], gSlot[1], synth, edge, feather, wb, H);
+    // New page enters from the sweep direction: edge sweeps span->0.
+    const int span = (dir == 0 || dir == 1) ? W : H;
+    const int edge = span - (span * i) / steps;
+    composeWipeDir(gSlot[0], gSlot[1], synth, edge, feather, wb, H, dir);
     gDisplay->waveformLabRefresh(gSlot[0], synth, gLut, /*turnOff=*/false);
-    // New baseline for the next step: the panel now shows synth.
-    std::swap(gSlot[0], synth);
+    delay(2);  // yield WDT / other tasks
   }
+  // Ghost-clearing tail: AFTER the wipe animation, keep driving the full
+  // old->new differential for `tailMs` wall time (measured from the end of
+  // the animation, not the start), so residual old-page ink keeps settling.
+  // RED stays the ORIGINAL page1, BW is the FINAL page2 — every changed
+  // pixel is re-driven each pass (multipass settling).
+  if (tailMs > 0) {
+    uint32_t target = tailMs;
+    if (target > 10000) target = 10000;
+    const uint32_t tailStart = millis();
+    int tail = 0;
+    while (tail < 12 && (millis() - tailStart) < target) {
+      gDisplay->waveformLabRefresh(gSlot[0], gSlot[1], gLut, /*turnOff=*/false);
+      ++tail;
+      delay(2);
+    }
+#if defined(ARDUINO_ARCH_ESP32)
+    Serial.printf("[LAB] ghost-clear tail passes=%d\n", tail);
+#endif
+  }
+  free(synth);
   gRunning = false;
   const uint32_t total = millis() - t0;
   ++gRuns;
   gLastRunMs = total;
-  // Diagnostics to SD.
   {
     FsFile f;
     if (SDCardManager::getInstance().openFileForWrite("LAB", "/waveform/lab_diag.txt", f)) {
-      char line[96];
-      snprintf(line, sizeof(line), "animate steps=%d feather=%d total=%ums\n", steps, feather,
+      char line[128];
+      snprintf(line, sizeof(line),
+               "animate kindle multipass steps=%d feather=%d total=%ums\n", steps, feather,
                static_cast<unsigned>(total));
       f.write(line, strlen(line));
       f.close();
     }
   }
+  return total;
+}
+
+namespace {
+
+// Async animation session (pumped from the main loop so the loop never blocks
+// for the whole animation — blocking starves the WDT / e-ink tasks).
+// mode: 0 = full-frame Kindle multipass (lut_animate)
+//       1 = window multipass of the growing covered region (lut_wipe)
+struct AnimSession {
+  bool active = false;
+  int mode = 0;
+  int steps = 0;
+  int cur = 0;
+  int feather = 0;
+  int W = 800;
+  int wb = 100;
+  int H = 480;
+  uint8_t* synth = nullptr;  // mode 0 only: BW wipe buffer
+  uint32_t t0 = 0;
+};
+AnimSession gAnim;
+
+}  // namespace
+
+bool startAnimateWindow(const char* prevPath, const char* nextPath, int steps) {
+  return startAnimate(prevPath, nextPath, steps, 0, /*windowMode=*/true);
+}
+
+bool startAnimate(const char* prevPath, const char* nextPath, int steps, int feather, bool windowMode) {
+  if (gRunning || gAnim.active) return false;
+  if (!gLutSet) return false;
+  if (steps < 1) steps = 1;
+  if (steps > 64) steps = 64;
+  if (feather < 0) feather = 0;
+  if (feather > 64) feather = 64;
+  if (!readFrameIntoSlot(prevPath, 0)) return false;
+  if (!readFrameIntoSlot(nextPath, 1)) return false;
+  if (!windowMode) {
+    gAnim.synth = allocSlot();
+    if (!gAnim.synth) return false;
+  }
+  gAnim.active = true;
+  gAnim.mode = windowMode ? 1 : 0;
+  gAnim.steps = steps;
+  gAnim.cur = 1;
+  gAnim.feather = feather;
+  gAnim.t0 = millis();
+  gRunning = true;
+  return true;
+}
+
+bool pumpAnimateWindow(uint32_t& stepMsOut) {
+  if (!gAnim.active) return false;
+  if (gAnim.cur > gAnim.steps) {
+    gAnim.active = false;
+    gRunning = false;
+    if (gAnim.synth) {
+      free(gAnim.synth);
+      gAnim.synth = nullptr;
+    }
+    ++gRuns;
+    gLastRunMs = millis() - gAnim.t0;
+    return false;
+  }
+  if (gAnim.mode == 0) {
+    // Full-frame Kindle multipass: RED always original page1, BW = wipe.
+    // Never swap synth into gSlot[0] — originals must stay intact.
+    if (!gAnim.synth) return false;
+    std::memset(gAnim.synth, 0, kFrameBytes);
+    const int edge = gAnim.W - (gAnim.W * gAnim.cur) / gAnim.steps;
+    composeWipe(gSlot[0], gSlot[1], gAnim.synth, edge, gAnim.feather, gAnim.wb, gAnim.H);
+    gAnim.cur++;
+    const uint32_t t0 = millis();
+    gDisplay->waveformLabRefresh(gSlot[0], gAnim.synth, gLut, /*turnOff=*/false);
+    stepMsOut = millis() - t0;
+    return true;
+  }
+  // Window multipass: refresh the ENTIRE covered region [edge, W] each step
+  // with RED=page1 / BW=page2 (real pages).  Already-covered strips are
+  // rewritten and re-driven every later step → progressive ink settling.
+  // (Old path only refreshed the newly entered strip once — one-shot freeze.)
+  int edge = gAnim.W - (gAnim.W * gAnim.cur) / gAnim.steps;
+  edge &= ~7;  // byte-align for SSD1677 window
+  if (gAnim.cur == gAnim.steps) edge = 0;
+  gAnim.cur++;
+  const int w = gAnim.W - edge;
+  if (w <= 0) {
+    stepMsOut = 0;
+    return true;
+  }
+  const uint32_t t0 = millis();
+  gDisplay->waveformLabRefreshWindow(gSlot[0], gSlot[1], gLut,
+                                     static_cast<uint16_t>(edge), 0,
+                                     static_cast<uint16_t>(w), static_cast<uint16_t>(gAnim.H));
+  stepMsOut = millis() - t0;
+  return true;
+}
+
+bool animateActive() { return gAnim.active; }
+
+uint32_t runAnimateWindow(const char* prevPath, const char* nextPath, int steps) {
+  // Keep the blocking path for CLI/scripts; the GUI uses the async session.
+  if (!startAnimateWindow(prevPath, nextPath, steps)) return 0;
+  uint32_t stepMs = 0;
+  while (pumpAnimateWindow(stepMs)) {
+    // Feed the watchdog and yield so the system stays alive during a long
+    // animation driven from the main loop.
+    delay(2);
+  }
+  return gLastRunMs;
+}
+
+uint32_t runSettle(const char* prevPath, const char* nextPath) {
+  if (!gDisplay || gRunning) return 0;
+  if (!gLutSet) return 0;
+  if (!readFrameIntoSlot(prevPath, 0)) return 0;
+  if (!readFrameIntoSlot(nextPath, 1)) return 0;
+  gRunning = true;
+  const uint32_t t0 = millis();
+  // Full-frame differential: RED=old, BW=new -> drive every changed pixel
+  // one more time with the (stronger) currently loaded SETTLE LUT.
+  gDisplay->waveformLabRefresh(gSlot[0], gSlot[1], gLut, /*turnOff=*/false);
+  gRunning = false;
+  const uint32_t total = millis() - t0;
+  ++gRuns;
+  gLastRunMs = total;
   return total;
 }
 
