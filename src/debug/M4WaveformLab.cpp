@@ -179,11 +179,13 @@ void composeWipe(const uint8_t* old, const uint8_t* newFrame, uint8_t* out, int 
                  int widthBytes, int height) {
   const int W = widthBytes * 8;
   if (edge >= W) {
-    std::memcpy(out, newFrame, static_cast<size_t>(widthBytes) * height);
+    // Full old page: the wipe edge has not started moving yet.
+    std::memcpy(out, old, static_cast<size_t>(widthBytes) * height);
     return;
   }
   if (edge <= 0) {
-    std::memcpy(out, old, static_cast<size_t>(widthBytes) * height);
+    // Full new page: the wipe is complete.
+    std::memcpy(out, newFrame, static_cast<size_t>(widthBytes) * height);
     return;
   }
   for (int row = 0; row < height; ++row) {
@@ -233,7 +235,9 @@ uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int f
   // Then each step refreshes prev->synth with the animation LUT.
   for (int i = 1; i <= steps; ++i) {
     std::memset(synth, 0, kFrameBytes);
-    const int edge = (W * i) / steps;
+    // New page enters from the right: the edge starts at W and sweeps left
+    // to 0.  (x >= edge => new page, so edge must DECREASE over steps.)
+    const int edge = W - (W * i) / steps;
     composeWipe(gSlot[0], gSlot[1], synth, edge, feather, wb, H);
     gDisplay->waveformLabRefresh(gSlot[0], synth, gLut, /*turnOff=*/false);
     // New baseline for the next step: the panel now shows synth.
