@@ -619,6 +619,26 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
     replyOk(reqId, "{\"op\":\"lut_set_frames\",\"ok\":true}", true);
     return;
   }
+  if (strcmp(op, "lut_animate") == 0) {
+    const char* prev = doc["prev"] | "";
+    const char* next = doc["next"] | "";
+    const int steps = doc["steps"] | 6;
+    const int feather = doc["feather"] | 12;
+    if (!prev[0] || !next[0]) {
+      replyErr(reqId, "bad_path", "prev/next 路径必填");
+      return;
+    }
+    const uint32_t ms = M4WaveformLab::runAnimate(prev, next, steps, feather);
+    if (ms == 0) {
+      replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
+      return;
+    }
+    char out[128];
+    snprintf(out, sizeof(out), "{\"op\":\"lut_animate\",\"ok\":true,\"ms\":%u,\"steps\":%d}",
+             static_cast<unsigned>(ms), steps);
+    replyOk(reqId, out);
+    return;
+  }
   if (strcmp(op, "lut_baseline") == 0) {
     const char* frame = doc["frame"] | "";
     if (!frame[0]) {

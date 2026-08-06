@@ -51,6 +51,11 @@ bool setSdFrames(const char* prevPath, const char* nextPath);
 // Establish the physical baseline: FULL-refresh the panel to the given SD
 // frame so subsequent FAST differential runs start from a known state.
 bool baselineFromSd(const char* framePath);
+// On-device computed wipe animation: read prev/next from SD into PSRAM, then
+// synthesize `steps` intermediate frames (new page enters from the right,
+// feather px dithered edge) and refresh each with the current LUT.
+// Returns total ms, or 0 on failure. steps==0 disables animation.
+uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int feather);
 bool setLut(const uint8_t* lut, size_t len, bool unlockVoltages);
 uint32_t runRefresh(bool swapAfter);   // returns last run ms (0 on failure)
 void clearAll();                       // safe full refresh + reset state

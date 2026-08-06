@@ -169,8 +169,95 @@ bool setLut(const uint8_t* lut, size_t len, bool unlockVoltages) {
   return true;
 }
 
-uint32_t runRefresh(bool swapAfter) {
+namespace {
+
+// Compose one wipe frame: right `edge` columns are new page, left is old;
+// `feather` px around the edge use a sparse dithered transition so the slide
+// reads smooth instead of a dense checkered fence.  edge>=W: full new page;
+// edge<=0: full old page.
+void composeWipe(const uint8_t* old, const uint8_t* newFrame, uint8_t* out, int edge, int feather,
+                 int widthBytes, int height) {
+  const int W = widthBytes * 8;
+  if (edge >= W) {
+    std::memcpy(out, newFrame, static_cast<size_t>(widthBytes) * height);
+    return;
+  }
+  if (edge <= 0) {
+    std::memcpy(out, old, static_cast<size_t>(widthBytes) * height);
+    return;
+  }
+  for (int row = 0; row < height; ++row) {
+    const int rowOff = row * widthBytes;
+    for (int x = 0; x < W; ++x) {
+      int v = 0;
+      const int bx = x / 8;
+      const int bit = 0x80 >> (x % 8);
+      if (x < edge - feather) {
+        v = (old[rowOff + bx] & bit) ? 1 : 0;
+      } else if (x >= edge) {
+        v = (newFrame[rowOff + bx] & bit) ? 1 : 0;
+      } else {
+        // Sparse blend: every 2nd column samples the new page inside the
+        // band; the rest keep the old page -> soft edge, no dense fence.
+        const int d = x - (edge - feather);
+        v = ((d & 1) == 0) ? (((newFrame[rowOff + bx] & bit) ? 1 : 0))
+                           : (((old[rowOff + bx] & bit) ? 1 : 0));
+      }
+      if (v) out[rowOff + bx] |= bit;
+    }
+  }
+}
+
+}  // namespace
+
+uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int feather) {
   if (!gDisplay || gRunning) return 0;
+  if (!gLutSet) return 0;
+  if (steps < 1) steps = 1;
+  if (steps > 64) steps = 64;
+  if (feather < 0) feather = 0;
+  if (feather > 64) feather = 64;
+  if (!readFrameIntoSlot(prevPath, 0)) return 0;
+  if (!readFrameIntoSlot(nextPath, 1)) return 0;
+  // Third buffer for the synthesized intermediate frame.
+  uint8_t* synth = allocSlot();
+  if (!synth) return 0;
+
+  const int W = 800;
+  const int wb = W / 8;
+  const int H = 480;
+  const uint32_t t0 = millis();
+  gRunning = true;
+  // Baseline: the panel currently shows prev (host should have FULL-cleared to
+  // prev first, but be safe: run a FAST diff from prev to prev = no-op).
+  // Then each step refreshes prev->synth with the animation LUT.
+  for (int i = 1; i <= steps; ++i) {
+    std::memset(synth, 0, kFrameBytes);
+    const int edge = (W * i) / steps;
+    composeWipe(gSlot[0], gSlot[1], synth, edge, feather, wb, H);
+    gDisplay->waveformLabRefresh(gSlot[0], synth, gLut, /*turnOff=*/false);
+    // New baseline for the next step: the panel now shows synth.
+    std::swap(gSlot[0], synth);
+  }
+  gRunning = false;
+  const uint32_t total = millis() - t0;
+  ++gRuns;
+  gLastRunMs = total;
+  // Diagnostics to SD.
+  {
+    FsFile f;
+    if (SDCardManager::getInstance().openFileForWrite("LAB", "/waveform/lab_diag.txt", f)) {
+      char line[96];
+      snprintf(line, sizeof(line), "animate steps=%d feather=%d total=%ums\n", steps, feather,
+               static_cast<unsigned>(total));
+      f.write(line, strlen(line));
+      f.close();
+    }
+  }
+  return total;
+}
+
+uint32_t runRefresh(bool swapAfter) {  if (!gDisplay || gRunning) return 0;
   if (!gLutSet) return 0;
   if (gSdFramesSet) {
     if (!readFrameIntoSlot(gSdPrev, 0) || !readFrameIntoSlot(gSdNext, 1)) return 0;

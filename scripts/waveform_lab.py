@@ -221,6 +221,11 @@ def main() -> None:
     p = sub.add_parser("frame1"); p.add_argument("pbm"); p.set_defaults(fn=None)
     p = sub.add_parser("sdframes"); p.add_argument("prev"); p.add_argument("next")
     p = sub.add_parser("baseline"); p.add_argument("frame")
+    p = sub.add_parser("wipe")
+    p.add_argument("prev")
+    p.add_argument("next")
+    p.add_argument("--steps", type=int, default=6)
+    p.add_argument("--feather", type=int, default=12)
     p = sub.add_parser("lut")
     p.add_argument("--hex", help="comma/space separated 105+ bytes (waveform first)")
     p.add_argument("--unlock", action="store_true", help="allow voltage bytes to pass through")
@@ -265,6 +270,10 @@ def main() -> None:
         print(json.dumps(r, ensure_ascii=False))
     elif args.cmd == "animate":
         animate(c, args)
+    elif args.cmd == "wipe":
+        r = c.request({"op": "lut_animate", "prev": args.prev, "next": args.next,
+                       "steps": args.steps, "feather": args.feather}, timeout=120)
+        print(json.dumps(r, ensure_ascii=False))
     elif args.cmd == "run":
         r = c.request({"op": "lut_run", "swap": args.swap}, timeout=30)
         print(json.dumps(r, ensure_ascii=False))
