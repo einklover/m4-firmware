@@ -516,6 +516,13 @@ void setupDisplayAndFonts() {
 
 void setup() {
     // force serial for debugging
+    // USB CDC RX queue is small by default; the debug bridge sends control
+    // frames up to ~800B (Waveform Lab LUT uploads) and the e-ink main loop
+    // can be blocked by BUSY for 100+ ms, so a tiny queue drops frames.
+    // Enlarge before begin() (runtime, the compile-time macro is ignored).
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+    Serial.setRxBufferSize(8192);
+#endif
     Serial.begin(115200);
     delay(500);
     Serial.printf("[%lu] [M4-RC1] setup() start ver=" CROSSPOINT_VERSION "\n", millis());

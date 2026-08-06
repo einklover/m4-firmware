@@ -87,10 +87,20 @@ def upload_lut(client: Client, hex_bytes: bytes, unlock: bool) -> None:
     if not unlock:
         lut[105:] = SAFE_VOLTAGE_TAIL
     b64 = base64.b64encode(bytes(lut)).decode()
-    r = client.request({"op": "lut_upload", "lut": b64, "unlock_voltages": unlock}, timeout=10)
-    if not r.get("ok"):
-        raise SystemExit(f"lut_upload failed: {r}")
-    print(f"LUT set ({len(lut)} bytes, voltages {'unlocked' if unlock else 'LOCKED safe tail'})")
+    # The device CDC path occasionally drops a long request line while the
+    # e-ink loop is busy; retry a few times before giving up.
+    last = None
+    for attempt in range(5):
+        try:
+            r = client.request({"op": "lut_upload", "lut": b64, "unlock_voltages": unlock}, timeout=12)
+            if r.get("ok"):
+                print(f"LUT set ({len(lut)} bytes, voltages {'unlocked' if unlock else 'LOCKED safe tail'})")
+                return
+            last = r
+        except Exception as e:  # noqa: BLE001
+            last = e
+        time.sleep(1.0)
+    raise SystemExit(f"lut_upload failed after retries: {last}")
 
 
 def animate(client: Client, args) -> None:

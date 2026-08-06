@@ -187,6 +187,18 @@ uint32_t runRefresh(bool swapAfter) {
   }
   gRunning = false;
   ++gRuns;
+  // Diagnostics: append one line to /waveform/lab_diag.txt (SD), so the host
+  // can read the actual refresh path taken without racing the log stream.
+  {
+    FsFile f;
+    if (SDCardManager::getInstance().openFileForWrite("LAB", "/waveform/lab_diag.txt", f)) {
+      char line[96];
+      snprintf(line, sizeof(line), "run=%u ms=%u lut_set=%d\n", static_cast<unsigned>(gRuns),
+               static_cast<unsigned>(gLastRunMs), gLutSet ? 1 : 0);
+      f.write(line, strlen(line));
+      f.close();
+    }
+  }
   return gLastRunMs;
 }
 
