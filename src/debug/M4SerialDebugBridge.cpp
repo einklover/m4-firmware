@@ -2,6 +2,8 @@
 
 #include "debug/M4SerialDebugBridge.h"
 
+#include "debug/M4WaveformLab.h"
+
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <GfxRenderer.h>
@@ -197,13 +199,15 @@ bool ensureStaConnected(uint32_t timeoutMs);
 
 }  // namespace
 
-void Bridge::begin(GfxRenderer* renderer, MappedInputManager* input, HostHooks hooks) {
+void Bridge::begin(GfxRenderer* renderer, MappedInputManager* input, HalDisplay* display, HostHooks hooks) {
   renderer_ = renderer;
   input_ = input;
   hooks_ = std::move(hooks);
   auth_ = {};
   intake_.reset();
   intake_.discardUntilNewline = false;
+  // Waveform Lab (hidden USB feature) uses the live panel driver.
+  M4WaveformLab::setDisplay(display);
   // Bridge compiled in; remains unauthorized until Developer Options enables it.
   Serial.printf("[%lu] [M4DBG] serial debug bridge present protocol=%d (auth=off)\n", millis(), kProtocolVersion);
 }
@@ -558,8 +562,118 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
     return;
   }
 
-  if (strcmp(op, "install_begin") == 0) {
-    // Idempotent: same req id already handled via tryIdemReplay at top.
+  // --- Waveform Lab (hidden USB feature) ---
+  if (strcmp(op, "lut_begin") == 0) {
+    if (uploadActive_ || shotActive_) {
+      replyErr(reqId, "busy", "设备忙，请稍后重试");
+      return;
+    }
+    const int slot = doc["slot"] | 0;
+    const uint32_t size = doc["size"] | 0;
+    if (slot < 0 || slot > 1) {
+      replyErr(reqId, "bad_slot", "槽位非法");
+      return;
+    }
+    if (size != M4WaveformLab::kFrameBytes) {
+      replyErr(reqId, "bad_size", "帧大小必须为 48000");
+      return;
+    }
+    if (!M4WaveformLab::beginFrameUpload(slot)) {
+      replyErr(reqId, "lab_oom", "PSRAM 帧缓存分配失败");
+      return;
+    }
+    chunk_.begin(size);
+    labFrameActive_ = true;
+    labFrameSlot_ = slot;
+    replyOk(reqId, "{\"op\":\"lut_begin\",\"ready\":true}", true);
+    return;
+  }
+  if (strcmp(op, "lut_upload") == 0) {
+    const char* b64 = doc["lut"] | "";
+    const bool unlock = doc["unlock_voltages"] | false;
+    uint8_t lut[M4WaveformLab::kLutBytes];
+    size_t n = 0;
+    if (!M4SerialDebugPolicy::b64DecodeStrict(b64, strlen(b64), lut, sizeof(lut), n) ||
+        n != M4WaveformLab::kLutBytes) {
+      replyErr(reqId, "bad_lut", "LUT 必须为 110 字节");
+      return;
+    }
+    if (!M4WaveformLab::setLut(lut, n, unlock)) {
+      replyErr(reqId, "lut_locked", "电压字节被锁定（unlock_voltages=true 才可改）");
+      return;
+    }
+    replyOk(reqId, "{\"op\":\"lut_upload\",\"ok\":true}", true);
+    return;
+  }
+  if (strcmp(op, "lut_set_frames") == 0) {
+    const char* prev = doc["prev"] | "";
+    const char* next = doc["next"] | "";
+    if (!prev[0] || !next[0]) {
+      replyErr(reqId, "bad_path", "prev/next 路径必填");
+      return;
+    }
+    if (!M4WaveformLab::setSdFrames(prev, next)) {
+      replyErr(reqId, "bad_frames", "SD 帧不存在或大小不是 48000");
+      return;
+    }
+    replyOk(reqId, "{\"op\":\"lut_set_frames\",\"ok\":true}", true);
+    return;
+  }
+  if (strcmp(op, "lut_baseline") == 0) {
+    const char* frame = doc["frame"] | "";
+    if (!frame[0]) {
+      replyErr(reqId, "bad_path", "frame 路径必填");
+      return;
+    }
+    if (!M4WaveformLab::baselineFromSd(frame)) {
+      replyErr(reqId, "bad_frame", "SD 帧不存在或 FULL 刷新失败");
+      return;
+    }
+    replyOk(reqId, "{\"op\":\"lut_baseline\",\"ok\":true}");
+    return;
+  }
+  if (strcmp(op, "lut_run") == 0) {
+    const bool swap = doc["swap"] | false;
+    const uint32_t ms = M4WaveformLab::runRefresh(swap);
+    if (ms == 0) {
+      replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
+      return;
+    }
+    char out[96];
+    snprintf(out, sizeof(out), "{\"op\":\"lut_run\",\"ok\":true,\"ms\":%u}", static_cast<unsigned>(ms));
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_swap") == 0) {
+    M4WaveformLab::swapSlots();
+    replyOk(reqId, "{\"op\":\"lut_swap\",\"ok\":true}");
+    return;
+  }
+  if (strcmp(op, "lut_stats") == 0) {
+    const auto s = M4WaveformLab::stats();
+    char out[160];
+    snprintf(out, sizeof(out),
+             "{\"op\":\"lut_stats\",\"ok\":true,\"last_ms\":%u,\"runs\":%u,\"lut_set\":%s,"
+             "\"active\":%s,\"frames_ready\":%s}",
+             static_cast<unsigned>(s.lastRunMs), static_cast<unsigned>(s.runs),
+             s.lutSet ? "true" : "false", s.active ? "true" : "false",
+             s.framesReady ? "true" : "false");
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_clear") == 0) {
+    M4WaveformLab::clearAll();
+    replyOk(reqId, "{\"op\":\"lut_clear\",\"ok\":true}");
+    return;
+  }
+  if (strcmp(op, "lut_end") == 0) {
+    abortUpload(false);
+    labFrameActive_ = false;
+    replyOk(reqId, "{\"op\":\"lut_end\",\"ok\":true}", true);
+    return;
+  }
+
+  if (strcmp(op, "install_begin") == 0) {  // Idempotent: same req id already handled via tryIdemReplay at top.
     if (uploadActive_ || shotActive_) {
       replyErr(reqId, "busy", "设备忙，请稍后重试");
       return;
@@ -777,6 +891,7 @@ void Bridge::abortUpload(bool removePart) {
   uploadName_[0] = 0;
   chunk_.reset();
   lastChunkAckJson_[0] = 0;
+  labFrameActive_ = false;
 }
 
 void Bridge::handleChk(const char* reqId, uint32_t seq, uint32_t total, const uint8_t* data, size_t len) {
@@ -796,6 +911,23 @@ void Bridge::handleChk(const char* reqId, uint32_t seq, uint32_t total, const ui
                 strcmp(err, "size_overflow") == 0)) {
       abortUpload(true);
     }
+    return;
+  }
+
+  if (labFrameActive_) {
+    if (!M4WaveformLab::frameChunkAppend(data, len)) {
+      replyErr(reqId, "lab_frame", "帧上传失败");
+      abortUpload(false);
+      return;
+    }
+    chunk_.commitAccept(reqId, seq, total, len);
+    if (chunk_.bytesReceived == chunk_.byteTotal) {
+      M4WaveformLab::endFrameUpload(labFrameSlot_);
+      labFrameActive_ = false;
+    }
+    snprintf(lastChunkAckJson_, sizeof(lastChunkAckJson_), "{\"chunk\":%u,\"received\":%u}",
+             static_cast<unsigned>(seq), static_cast<unsigned>(chunk_.bytesReceived));
+    replyOk(reqId, lastChunkAckJson_, true);
     return;
   }
 

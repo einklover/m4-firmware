@@ -859,7 +859,7 @@ void setup() {
         code = r.manifest.versionCode;
         return true;
       };
-      gM4DebugBridge.begin(&renderer, &mappedInputManager, std::move(hooks));
+      gM4DebugBridge.begin(&renderer, &mappedInputManager, &display, std::move(hooks));
       // Apply persisted setting (default off). No serial path can enable this.
       gM4DebugBridge.setAuthorized(SETTINGS.developerSerialDebugEnabled == 1);
     }

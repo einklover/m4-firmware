@@ -56,6 +56,13 @@ class HalDisplay {
 
   void displayGrayBuffer(bool turnOffScreen = false);
 
+  // Waveform Lab: run one prev->next transition with a caller-supplied
+  // 110-byte LUT.  Returns BUSY wait elapsed ms (0 if unsupported).
+  uint32_t waveformLabRefresh(const uint8_t* prev, const uint8_t* next, const uint8_t* lut,
+                              bool turnOff = false);
+  // Waveform Lab: absolute FULL refresh to the given frame (baseline setup).
+  void waveformLabBaseline(const uint8_t* frame);
+
  private:
   EInkDisplay einkDisplay;
 };

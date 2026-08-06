@@ -78,3 +78,12 @@ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay
 void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
 
 void HalDisplay::displayGrayBuffer(bool turnOffScreen) { einkDisplay.displayGrayBuffer(turnOffScreen); }
+
+uint32_t HalDisplay::waveformLabRefresh(const uint8_t* prev, const uint8_t* next, const uint8_t* lut,
+                                        bool turnOff) {
+  return einkDisplay.waveformLabRefresh(prev, next, lut, turnOff);
+}
+
+void HalDisplay::waveformLabBaseline(const uint8_t* frame) {
+  einkDisplay.waveformLabBaseline(frame);
+}

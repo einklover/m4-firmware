@@ -482,8 +482,35 @@ class Client:
         commit_to = min(float(timeout), _remain())
         return self.request({"op": "install_commit"}, timeout=max(5.0, commit_to))
 
-    def launch(self, app_id: str) -> dict:
-        return self.request({"op": "launch", "app_id": app_id}, timeout=15)
+    def send_raw_chunk(
+        self,
+        seq: int,
+        total: int,
+        part: bytes,
+        timeout: float = 15.0,
+        chunk_retries: int = 3,
+    ) -> dict:
+        """Send one raw chunk with a stable per-chunk request id (lab frames etc.)."""
+        cid = f"labc{seq}"
+        last_err: Optional[BridgeError] = None
+        for attempt in range(max(1, chunk_retries)):
+            try:
+                self.t.write(build_chk(cid, seq, total, part))
+                fr = self._read_until(
+                    lambda f, i=cid: f.req_id == i and f.kind in ("ok", "err"),
+                    timeout=timeout,
+                )
+                if fr.kind == "err":
+                    j = fr.json or {}
+                    raise BridgeError(j.get("error", "error"), j.get("message", ""))
+                return fr.json or {}
+            except BridgeError as e:
+                last_err = e
+                if e.key != "timeout" or attempt + 1 >= chunk_retries:
+                    raise
+        raise last_err  # pragma: no cover
+
+    def launch(self, app_id: str) -> dict:        return self.request({"op": "launch", "app_id": app_id}, timeout=15)
 
     def tap(self, x: int, y: int) -> dict:
         return self.request({"op": "tap", "x": int(x), "y": int(y)}, timeout=5)

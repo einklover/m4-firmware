@@ -15,6 +15,7 @@
 
 class GfxRenderer;
 class MappedInputManager;
+class HalDisplay;
 
 namespace M4SerialDebug {
 
@@ -59,7 +60,7 @@ struct HostHooks {
 
 class Bridge {
  public:
-  void begin(GfxRenderer* renderer, MappedInputManager* input, HostHooks hooks);
+  void begin(GfxRenderer* renderer, MappedInputManager* input, HalDisplay* display, HostHooks hooks);
   // Owner main loop only. desiredAuthorized comes from SETTINGS (local UI only).
   // Transitions are idempotent; enable flushes stale RX, disable aborts work.
   void setAuthorized(bool desiredAuthorized);
@@ -97,6 +98,10 @@ class Bridge {
   char shotReqId_[kMaxReqIdLen + 1] = {};
   uint32_t shotOffset_ = 0;
   uint32_t shotTotal_ = 0;
+
+  // Waveform Lab frame upload: chunks land in a PSRAM slot instead of SD.
+  bool labFrameActive_ = false;
+  int labFrameSlot_ = 0;
 
   struct IdemSlot {
     char id[kMaxReqIdLen + 1] = {};
