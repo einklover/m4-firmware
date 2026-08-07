@@ -57,6 +57,11 @@ class M4xLuaHost {
   // Owner-task only.
   void stop();
 
+  // Drop host-owned HTTP/TLS state without disconnecting Wi-Fi. Native reader
+  // handoff uses this to return mbedTLS session buffers to internal RAM before
+  // allocating reader/index scratch. Owner-task only.
+  void releaseNetworkSession();
+
   size_t luaMemUsed() const { return budget_.memUsed; }
   size_t luaMemPeak() const { return budget_.memPeak; }
   size_t luaMemLimit() const { return budget_.memLimit; }
