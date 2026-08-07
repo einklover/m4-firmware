@@ -10,6 +10,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(ARDUINO_ARCH_ESP32)
+#include <esp_heap_caps.h>
+#endif
+
 namespace ttf {
 
 namespace {
@@ -33,6 +37,52 @@ Pt applyXform(const Xform& m, float x, float y, bool on) {
   return {m.a * x + m.c * y + m.tx, m.b * x + m.d * y + m.ty, on};
 }
 
+// PSRAM-first ONLY for the font's persistent cmap table: a CJK TTF keeps a
+// tens-of-KB cmap subtable resident, which on internal RAM permanently
+// starves mbedTLS handshakes (jjwxc "list too large; back to shelf").
+// Rasterizer scratch stays on internal RAM — it is touched per-pixel on the
+// render hot path and PSRAM cache access measurably slowed page rendering.
+void* ttfAllocPsram(size_t n) {
+  if (n == 0) return nullptr;
+#if defined(ARDUINO_ARCH_ESP32)
+  void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = heap_caps_malloc(n, MALLOC_CAP_8BIT);
+  return p;
+#else
+  return std::malloc(n);
+#endif
+}
+
+void* ttfAlloc(size_t n) {
+  if (n == 0) return nullptr;
+#if defined(ARDUINO_ARCH_ESP32)
+  return heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+  return std::malloc(n);
+#endif
+}
+
+void ttfFree(void* p) {
+  if (!p) return;
+#if defined(ARDUINO_ARCH_ESP32)
+  heap_caps_free(p);
+#else
+  std::free(p);
+#endif
+}
+
+void* ttfRealloc(void* ptr, size_t n) {
+  if (n == 0) {
+    ttfFree(ptr);
+    return nullptr;
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  return heap_caps_realloc(ptr, n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+  return std::realloc(ptr, n);
+#endif
+}
+
 }  // namespace
 
 uint32_t TtfFont::tagKey(const char tag[4]) {
@@ -43,10 +93,10 @@ uint32_t TtfFont::tagKey(const char tag[4]) {
 TtfFont::TtfFont() = default;
 
 TtfFont::~TtfFont() {
-  std::free(cmapData_);
-  std::free(glyfScratch_);
-  std::free(covScratch_);
-  std::free(packedScratch_);
+  ttfFree(cmapData_);
+  ttfFree(glyfScratch_);
+  ttfFree(covScratch_);
+  ttfFree(packedScratch_);
 }
 
 bool TtfFont::readAt(uint32_t off, void* dst, uint32_t n) const {
@@ -273,17 +323,17 @@ bool TtfFont::initCmap() {
     lastError_ = "cmap subtable exceeds memory safety limit";
     return false;
   }
-  uint8_t* data = (uint8_t*)std::malloc(avail);
+  uint8_t* data = (uint8_t*)ttfAllocPsram(avail);
   if (!data) {
     lastError_ = "cmap alloc failed";
     return false;
   }
   if (!readAt(cmap_.off + bestOff, data, avail)) {
-    std::free(data);
+    ttfFree(data);
     lastError_ = "failed to read cmap subtable";
     return false;
   }
-  std::free(cmapData_);
+  ttfFree(cmapData_);
   cmapData_ = data;
   cmapLen_ = avail;
 
@@ -452,7 +502,7 @@ bool TtfFont::collectGlyph(uint16_t gid, const Xform& xf, std::vector<Contour>& 
 
   const uint32_t sliceLen = gEnd - gStart;
   if (sliceLen > glyfScratchCap_) {
-    uint8_t* nb = (uint8_t*)std::realloc(glyfScratch_, sliceLen);
+    uint8_t* nb = (uint8_t*)ttfRealloc(glyfScratch_, sliceLen);
     if (!nb) return false;
     glyfScratch_ = nb;
     glyfScratchCap_ = sliceLen;
@@ -786,7 +836,7 @@ bool TtfFont::rasterize(uint16_t gid, uint16_t sizePx, GlyphBitmap& out) {
 
   const uint32_t npix = (uint32_t)w * (uint32_t)h;
   if (npix > covScratchCap_) {
-    uint8_t* nb = (uint8_t*)std::realloc(covScratch_, npix);
+    uint8_t* nb = (uint8_t*)ttfRealloc(covScratch_, npix);
     if (!nb) return false;
     covScratch_ = nb;
     covScratchCap_ = npix;
@@ -847,7 +897,7 @@ bool TtfFont::rasterize(uint16_t gid, uint16_t sizePx, GlyphBitmap& out) {
   // Pack 2-bit (0=white .. 3=black), 4 px/byte MSB-first.
   const uint32_t packedLen = (npix + 3) / 4;
   if (packedLen > packedScratchCap_) {
-    uint8_t* nb = (uint8_t*)std::realloc(packedScratch_, packedLen);
+    uint8_t* nb = (uint8_t*)ttfRealloc(packedScratch_, packedLen);
     if (!nb) return false;
     packedScratch_ = nb;
     packedScratchCap_ = packedLen;
@@ -871,13 +921,13 @@ bool TtfFont::rasterize(uint16_t gid, uint16_t sizePx, GlyphBitmap& out) {
 }
 
 void TtfFont::clearScratch() {
-  std::free(glyfScratch_);
+  ttfFree(glyfScratch_);
   glyfScratch_ = nullptr;
   glyfScratchCap_ = 0;
-  std::free(covScratch_);
+  ttfFree(covScratch_);
   covScratch_ = nullptr;
   covScratchCap_ = 0;
-  std::free(packedScratch_);
+  ttfFree(packedScratch_);
   packedScratch_ = nullptr;
   packedScratchCap_ = 0;
 }

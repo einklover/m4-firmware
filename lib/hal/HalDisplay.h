@@ -72,6 +72,11 @@ class HalDisplay {
   void waveformLabWriteDiffWindow(const uint8_t* prev, const uint8_t* next, uint16_t x, uint16_t y, uint16_t w,
                                   uint16_t h);
   uint32_t waveformLabActivate(const uint8_t* lut = nullptr);
+  // Window-scoped activate: limits the SSD1677 master activation scan to the
+  // given rectangle (setRamArea), restores the full-panel window afterwards.
+  // Used for local page-turn wipes so status/other regions are never re-driven.
+  uint32_t waveformLabActivateWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                     const uint8_t* lut = nullptr);
   void waveformLabEqualizeWindow(const uint8_t* frame, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
   void setCustomLUT(bool enabled, const unsigned char* lutData = nullptr);
 

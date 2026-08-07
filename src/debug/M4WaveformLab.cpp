@@ -231,7 +231,7 @@ void composeWipe(const uint8_t* old, const uint8_t* newFrame, uint8_t* out, int 
 }  // namespace
 
 uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int steps, int feather,
-                       uint32_t tailMs, int dir) {
+                       uint32_t tailMs, int dir, BodyClip bodyClip) {
   if (!gDisplay) return 0;
   // Recover from a previous stuck lab session so reader page-turns never hard-lock.
   if (gRunning) gRunning = false;
@@ -242,6 +242,9 @@ uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int ste
   if (feather < 0) feather = 0;
   if (feather > 64) feather = 64;
   if (dir < 0 || dir > 3) dir = 0;
+  if (bodyClip.active() && ((bodyClip.x % 8) != 0 || (bodyClip.w % 8) != 0)) {
+    bodyClip = {};  // invalid clip → full panel fallback
+  }
   // Single synth buffer only (previous code also allocated an unused 48KB spare).
   uint8_t* cur = allocSlot();
   if (!cur) return 0;
@@ -252,12 +255,24 @@ uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int ste
   gRunning = true;
   // No FULL baseline here: reader already shows oldFrame. Each step rewrites
   // full RED=old / BW=composeWipe, so uncovered columns stay idle (RED==BW).
+  // With a body clip both the write and the activation scan are limited to the
+  // body rectangle — status/other regions are physically off-panel and never
+  // re-driven (no ghosting, no full-frame refresh).
+  auto driveStep = [&](const uint8_t* redPlane, const uint8_t* bwPlane) {
+    if (bodyClip.active()) {
+      gDisplay->waveformLabWriteDiffWindow(redPlane, bwPlane, bodyClip.x, bodyClip.y, bodyClip.w,
+                                           bodyClip.h);
+      gDisplay->waveformLabActivateWindow(bodyClip.x, bodyClip.y, bodyClip.w, bodyClip.h, gLut);
+    } else {
+      gDisplay->waveformLabRefresh(redPlane, bwPlane, gLut, /*turnOff=*/false);
+    }
+  };
   for (int i = 1; i <= steps; ++i) {
     std::memset(cur, 0, kFrameBytes);
     const int span = (dir == 0 || dir == 1) ? W : H;
     const int edge = span - (span * i) / steps;
     composeWipeDir(oldFrame, newFrame, cur, edge, feather, wb, H, dir);
-    gDisplay->waveformLabRefresh(oldFrame, cur, gLut, /*turnOff=*/false);
+    driveStep(oldFrame, cur);
     delay(2);
   }
   if (tailMs > 0) {
@@ -266,7 +281,7 @@ uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int ste
     const uint32_t tailStart = millis();
     int tail = 0;
     while (tail < 12 && (millis() - tailStart) < target) {
-      gDisplay->waveformLabRefresh(oldFrame, newFrame, gLut, /*turnOff=*/false);
+      driveStep(oldFrame, newFrame);
       ++tail;
       delay(2);
     }
@@ -274,7 +289,11 @@ uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int ste
   // Final plane write: RED=BW=new with *stock* waveform (lut=nullptr). Custom
   // gLut here re-arms experiment DU and poisons the next reader FAST baseline.
   gDisplay->setCustomLUT(false, nullptr);
-  gDisplay->waveformLabRefresh(newFrame, newFrame, /*lut=*/nullptr, /*turnOff=*/false);
+  if (bodyClip.active()) {
+    gDisplay->waveformLabEqualizeWindow(newFrame, bodyClip.x, bodyClip.y, bodyClip.w, bodyClip.h);
+  } else {
+    gDisplay->waveformLabRefresh(newFrame, newFrame, /*lut=*/nullptr, /*turnOff=*/false);
+  }
   free(cur);
   gRunning = false;
   const uint32_t total = millis() - t0;

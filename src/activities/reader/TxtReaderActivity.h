@@ -146,6 +146,27 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   int chapternum = 0;
   bool chapter_loadPageIndexCache(int chapternum);
   void chapter_savePageIndexCache(int chapternum) const;
+  // Next-chapter page-index prefetch (provider-like). While the current chapter
+  // is fully indexed and the panel idle, chapter N+1's pageOffsets are built in
+  // the background and saved to chapter{N+1}.bin so a cross-chapter open is a
+  // cache hit. SD is time-sliced; never runs during an animation.
+  void libraryPrefetchReset();
+  bool chapter_pageIndexCacheExists(int ch) const;
+  void chapter_savePageIndexCacheOffsets(int ch, const std::vector<size_t>& offsets) const;
+  void libraryIdlePrefetchNextChapter();
+  // Diagnostic: append a page-load failure reason to the SD debug log (serial
+  // channel is unreliable on M4) so "every-other-page refresh" root causes are
+  // readable from the host.
+  void logPageLoadFail(const char* why, size_t offset, size_t bytes) const;
+  // Perf diagnostic: append a stage timing line to the SD perf log (serial
+  // channel is unreliable on M4). Used to find which render step is slow
+  // (TTF glyph rasterization vs SD read/decode vs physical refresh).
+  void logPerf(const char* step, uint32_t ms, int page, uint32_t extra = 0) const;
+  // Physical body rectangle (panel-native 800x480, byte-aligned) — the page-turn
+  // wipe window covers exactly this so status/other regions are off-panel.
+  bool computeBodyPhysicalWindow(uint16_t& x, uint16_t& y, uint16_t& w, uint16_t& h) const;
+  int statusBarLogicalTopY() const;
+  bool computeStatusBarPhysicalWindow(uint16_t& x, uint16_t& y, uint16_t& w, uint16_t& h) const;
   void chapter_initializeReader(int chapternum);
   bool chapter_initialized = false;
   bool needIndent = SETTINGS.firstlineintented;
@@ -188,6 +209,13 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   bool hasPendingRestore_ = false;
   bool userMovedPage_ = false;
   bool tidxSaved_ = false;  // save completed .tidx once per layout generation
+  // Next-chapter prefetch state (library). See libraryIdlePrefetchNextChapter.
+  int prefetchChapter_ = -1;
+  std::vector<size_t> prefetchOffsets_;
+  size_t prefetchCursor_ = 0;
+  size_t prefetchRangeEnd_ = 0;
+  bool prefetchComplete_ = false;
+  bool prefetchSkipped_ = false;
   // First physical paint after openText handoff: layout under lock, then
   // HALF_REFRESH outside the lock (absolute both-plane write — FAST is
   // differential and keeps residual Lua "打开阅读器…" when RED is stale).
@@ -219,6 +247,13 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   // (status "1/?"→"1/20", footer overlay churn) must NOT FAST-diff again —
   // that was the residual/ghost buildup while progressive index ran.
   int lastPhysicalBodyPage_ = -1;
+  // Decoupled quick page skip: rapid taps advance currentPage (user target)
+  // without loading/rendering; the physical refresh catches up once the
+  // in-flight animation finishes and the panel is idle (one full refresh
+  // straight to the target, intermediate pages skipped). No debounce — a slow
+  // tap (panel idle) starts the animation immediately.
+  bool quickMode_ = false;
+  uint32_t lastPageTurnMs_ = 0;
   // Set on onExit / openMenu so display task stops starting new frames.
   std::atomic<bool> suppressDisplay_{false};
   void finishPhysicalDisplay();  // displayBuffer + optional AA (no state lock)

@@ -109,6 +109,11 @@ uint32_t HalDisplay::waveformLabActivate(const uint8_t* lut) {
   return einkDisplay.waveformLabActivate(lut);
 }
 
+uint32_t HalDisplay::waveformLabActivateWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                               const uint8_t* lut) {
+  return einkDisplay.waveformLabActivateWindow(x, y, w, h, lut);
+}
+
 void HalDisplay::waveformLabEqualizeWindow(const uint8_t* frame, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
   einkDisplay.waveformLabEqualizeWindow(frame, x, y, w, h);
 }

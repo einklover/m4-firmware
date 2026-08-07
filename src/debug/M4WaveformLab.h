@@ -64,8 +64,18 @@ uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int f
 // In-memory page-turn animation: old/new are full physical frames (48000B,
 // 0=black 1=white) already in RAM (e.g. renderer.frameBuffer).  Runs the
 // same multipass wipe as runAnimate but without SD access.  Returns ms.
+// bodyClip (optional, byte-aligned x/w) limits every write AND the activation
+// scan to the body rectangle, so status/other regions are never re-driven
+// (local page-turn refresh; the wipe window walks the body fully).
+struct BodyClip {
+  uint16_t x = 0;
+  uint16_t y = 0;
+  uint16_t w = 0;
+  uint16_t h = 0;
+  bool active() const { return w > 0 && h > 0; }
+};
 uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int steps, int feather,
-                       uint32_t tailMs, int dir);
+                       uint32_t tailMs, int dir, BodyClip bodyClip = {});
 // Sliding-window partial wipe (SD frames): steps advances = steps refreshes,
 // then walk-off drain until the mult-wide trailing edge clears the panel
 // (~winMult more activates; no off-panel geometry). winMult = window width
