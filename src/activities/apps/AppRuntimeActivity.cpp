@@ -15,6 +15,7 @@
 #include "apps/M4ContentProviderSession.h"
 #include "apps/M4PluginReaderSession.h"
 #include "RecentBooksStore.h"
+#include "debug/M4HeapAudit.h"
 
 #include <cstring>
 #include <memory>
@@ -391,6 +392,8 @@ void AppRuntimeActivity::requestStopAndJoin() {
 
 void AppRuntimeActivity::onEnter() {
   ActivityWithSubactivity::onEnter();
+  M4HeapAudit::installFailedAllocHook();
+  M4HeapAudit::snapshot("app_runtime_enter");
   life_.reset();
   failed_.store(false, std::memory_order_relaxed);
   exitRequested_.store(false, std::memory_order_relaxed);
@@ -435,6 +438,7 @@ void AppRuntimeActivity::onEnter() {
     return;
   }
   ownerTaskStarted_ = true;
+  M4HeapAudit::snapshot("app_runtime_task_started");
 }
 
 void AppRuntimeActivity::onExit() {
@@ -482,6 +486,10 @@ void AppRuntimeActivity::tryLaunchPluginReader() {
     return;
   }
   const uint32_t handoffStartedMs = millis();
+  M4HeapAudit::currentTaskStack("M4xRuntime_before_reader");
+  M4HeapAudit::snapshot("reader_handoff_before_net_release");
+  host_.releaseNetworkSession();
+  M4HeapAudit::snapshot("reader_handoff_after_net_release");
   const uint32_t tLoad0 = millis();
   auto txt = std::make_unique<Txt>(req.absPath, "/.crosspoint");
   const bool loaded = txt->load();
@@ -489,6 +497,7 @@ void AppRuntimeActivity::tryLaunchPluginReader() {
                 loaded ? 1 : 0, static_cast<unsigned long>(millis() - tLoad0),
                 loaded ? static_cast<unsigned>(txt->getFileSize()) : 0u,
                 (loaded && txt->isEncodingSupported()) ? 1 : 0);
+  M4HeapAudit::snapshot("reader_handoff_after_txt_load");
   if (!loaded || !txt->isEncodingSupported()) {
     // Explicit open failure — never looks like a successful close at page 1.
     M4PluginReaderSession::ProgressSnapshot snap;
@@ -543,6 +552,7 @@ void AppRuntimeActivity::tryLaunchPluginReader() {
     // Provider books register in history (URI identity) after first open.
     sess.suppressRecentBooks = false;
   }
+  M4HeapAudit::snapshot("reader_handoff_before_reader_enter");
   enterNewActivity(new TxtReaderActivity(
       renderer, mappedInput, std::move(txt),
       [this]() {
@@ -553,6 +563,7 @@ void AppRuntimeActivity::tryLaunchPluginReader() {
         childClosePending_ = true;
       },
       std::move(sess)));
+  M4HeapAudit::snapshot("reader_handoff_after_reader_enter");
   M4PluginReaderSession::clearLaunchInProgress();
   Serial.printf("[WR05] t=%lu launch_entered gen=%u progressive=1\n", static_cast<unsigned long>(millis()),
                 static_cast<unsigned>(req.generation));
