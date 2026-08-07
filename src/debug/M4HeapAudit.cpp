@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <atomic>
+#include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_rom_sys.h>
 #include <freertos/FreeRTOS.h>
@@ -50,9 +51,13 @@ void snapshot(const char* tag) {
 }
 
 void currentTaskStack(const char* tag) {
+#if defined(INCLUDE_uxTaskGetStackHighWaterMark) && INCLUDE_uxTaskGetStackHighWaterMark
   const UBaseType_t watermark = uxTaskGetStackHighWaterMark(nullptr);
   Serial.printf("[M4MEM] stack tag=%s high_water=%u\n", tag ? tag : "?",
                 static_cast<unsigned>(watermark));
+#else
+  Serial.printf("[M4MEM] stack tag=%s high_water=disabled\n", tag ? tag : "?");
+#endif
 }
 
 }  // namespace M4HeapAudit
