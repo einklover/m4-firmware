@@ -1,0 +1,135 @@
+name: Apply M4 OOM phase1 patch
+
+on:
+  push:
+    branches:
+      - agent/fix-m4-internal-oom-phase1
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-m4-internal-oom-phase1
+          fetch-depth: 0
+
+      - name: Apply targeted source edits
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{path}: expected one match, got {count}: {old[:80]!r}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          # AppRuntime: free keep-alive mbedTLS state before native reader and
+          # record the exact internal/PSRAM delta around the handoff.
+          replace_once(
+              'src/activities/apps/AppRuntimeActivity.cpp',
+              '#include "RecentBooksStore.h"\n',
+              '#include "RecentBooksStore.h"\n#include "debug/M4HeapAudit.h"\n')
+
+          replace_once(
+              'src/activities/apps/AppRuntimeActivity.cpp',
+              'void AppRuntimeActivity::onEnter() {\n  ActivityWithSubactivity::onEnter();\n  life_.reset();',
+              'void AppRuntimeActivity::onEnter() {\n  ActivityWithSubactivity::onEnter();\n  M4HeapAudit::installFailedAllocHook();\n  M4HeapAudit::snapshot("app_runtime_enter");\n  life_.reset();')
+
+          replace_once(
+              'src/activities/apps/AppRuntimeActivity.cpp',
+              '  ownerTaskStarted_ = true;\n}\n\nvoid AppRuntimeActivity::onExit()',
+              '  ownerTaskStarted_ = true;\n  M4HeapAudit::snapshot("app_runtime_task_started");\n}\n\nvoid AppRuntimeActivity::onExit()')
+
+          replace_once(
+              'src/activities/apps/AppRuntimeActivity.cpp',
+              '  const uint32_t handoffStartedMs = millis();\n  const uint32_t tLoad0 = millis();',
+              '  const uint32_t handoffStartedMs = millis();\n  M4HeapAudit::currentTaskStack("M4xRuntime_before_reader");\n  M4HeapAudit::snapshot("reader_handoff_before_net_release");\n  host_.releaseNetworkSession();\n  M4HeapAudit::snapshot("reader_handoff_after_net_release");\n  const uint32_t tLoad0 = millis();')
+
+          replace_once(
+              'src/activities/apps/AppRuntimeActivity.cpp',
+              '                (loaded && txt->isEncodingSupported()) ? 1 : 0);\n  if (!loaded || !txt->isEncodingSupported()) {',
+              '                (loaded && txt->isEncodingSupported()) ? 1 : 0);\n  M4HeapAudit::snapshot("reader_handoff_after_txt_load");\n  if (!loaded || !txt->isEncodingSupported()) {')
+
+          replace_once(
+              'src/activities/apps/AppRuntimeActivity.cpp',
+              '  enterNewActivity(new TxtReaderActivity(\n      renderer, mappedInput, std::move(txt),',
+              '  M4HeapAudit::snapshot("reader_handoff_before_reader_enter");\n  enterNewActivity(new TxtReaderActivity(\n      renderer, mappedInput, std::move(txt),')
+
+          replace_once(
+              'src/activities/apps/AppRuntimeActivity.cpp',
+              '      std::move(sess)));\n  M4PluginReaderSession::clearLaunchInProgress();',
+              '      std::move(sess)));\n  M4HeapAudit::snapshot("reader_handoff_after_reader_enter");\n  M4PluginReaderSession::clearLaunchInProgress();')
+
+          # TxtReader: CPU-owned large windows live in PSRAM. SD reads still go
+          # through a small INTERNAL|DMA bounce buffer before copying to PSRAM.
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '#include "debug/M4WaveformLab.h"\n#include <HalDisplay.h>',
+              '#include "debug/M4WaveformLab.h"\n#include "debug/M4HeapAudit.h"\n#include "util/M4PsramBuffer.h"\n#include <HalDisplay.h>')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              'constexpr size_t kMaxPageReadBytes = 48 * 1024;  // hard cap for first-page adaptive buffer (heap; no PSRAM)\n\n// Cache file magic and version',
+              '''constexpr size_t kMaxPageReadBytes = 48 * 1024;  // hard cap for first-page adaptive buffer\n\n// Murphy M4 keeps reader windows in PSRAM, but the SD/SPI path may require an\n// internal DMA-capable destination. Bound that scarce memory to <=4 KiB and\n// copy each slice into the CPU-owned destination. Other boards keep the old\n// direct-read path.\nbool readTxtContentWithInternalBounce(Txt& source, uint8_t* dest, size_t offset, size_t len) {\n  if (!dest && len > 0) return false;\n  if (len == 0) return true;\n#ifdef CROSSPOINT_MURPHY_M4\n  size_t bounceSize = len < 4096 ? len : 4096;\n  uint8_t* bounce = nullptr;\n  while (!bounce && bounceSize >= 512) {\n    bounce = static_cast<uint8_t*>(\n        heap_caps_malloc(bounceSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));\n    if (!bounce) bounceSize /= 2;\n  }\n  if (!bounce) {\n    Serial.printf("[%lu] [TRS] SD bounce allocation failed len=%zu\\n", millis(), len);\n    return false;\n  }\n\n  size_t done = 0;\n  bool ok = true;\n  while (done < len) {\n    const size_t n = (len - done < bounceSize) ? (len - done) : bounceSize;\n    if (!source.readContent(bounce, offset + done, n, false)) {\n      ok = false;\n      break;\n    }\n    std::memcpy(dest + done, bounce, n);\n    done += n;\n  }\n  heap_caps_free(bounce);\n  return ok;\n#else\n  return source.readContent(dest, offset, len, false);\n#endif\n}\n\n// Cache file magic and version''')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '    chapterBuf = static_cast<uint8_t*>(malloc(chapterSize + 1));',
+              '    chapterBuf = static_cast<uint8_t*>(M4Psram::alloc(chapterSize + 1));')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '      if (txt->readContent(chapterBuf, beginByte, chapterSize, false)) {',
+              '      if (readTxtContentWithInternalBounce(*txt, chapterBuf, beginByte, chapterSize)) {')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '    buffer = static_cast<uint8_t*>(malloc(chunkSize + 1));',
+              '    buffer = static_cast<uint8_t*>(M4Psram::alloc(chunkSize + 1));')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '    if (!txt->readContent(buffer, offset, chunkSize, false)) {',
+              '    if (!readTxtContentWithInternalBounce(*txt, buffer, offset, chunkSize)) {')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '  std::vector<uint8_t> decodedOwned;\n  std::vector<M4TxtEncoding::CpBoundary> cpMap;',
+              '  M4Psram::Buffer<uint8_t> decodedOwned;\n  M4Psram::Buffer<M4TxtEncoding::CpBoundary> cpMap;')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '    decodedOwned.resize(outCap);\n    cpMap.resize(mapCap);',
+              '''    if (!decodedOwned.resize(outCap) || !cpMap.resize(mapCap)) {\n      Serial.printf("[%lu] [TRS] PSRAM decode scratch allocation failed raw=%zu out=%zu map=%zu\\n",\n                    millis(), rawPayload, outCap, mapCap);\n      if (needFree) free(buffer);\n      return false;\n    }''')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '  xTaskCreate(&TxtReaderActivity::taskTrampoline, "TxtReaderActivityTask",\n              8192,               // Stack size (increased for font loading + page indexing)',
+              '  M4HeapAudit::snapshot("txt_reader_before_task");\n  xTaskCreate(&TxtReaderActivity::taskTrampoline, "TxtReaderActivityTask",\n              8192,               // Stack size (increased for font loading + page indexing)')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '              &displayTaskHandle  // Task handle\n  );\n}',
+              '              &displayTaskHandle  // Task handle\n  );\n  M4HeapAudit::snapshot("txt_reader_after_task");\n}')
+
+          replace_once(
+              'src/activities/reader/TxtReaderActivity.cpp',
+              '  if (renderingMutex) {\n    vSemaphoreDelete(renderingMutex);\n    renderingMutex = nullptr;\n  }\n  pageOffsets.clear();',
+              '  if (renderingMutex) {\n    vSemaphoreDelete(renderingMutex);\n    renderingMutex = nullptr;\n  }\n  M4HeapAudit::snapshot("txt_reader_after_task_delete");\n  pageOffsets.clear();')
+          PY
+
+          rm -f .github/workflows/agent-apply-m4-oom-phase1.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix Murphy M4 internal RAM OOM"
+          git push origin HEAD:agent/fix-m4-internal-oom-phase1
