@@ -21,6 +21,8 @@
 #include "util/M4PluginReaderStatePolicy.h"
 #include "util/M4ProgressiveTxtIndex.h"
 #include "debug/M4WaveformLab.h"
+#include "debug/M4HeapAudit.h"
+#include "util/M4PsramBuffer.h"
 #include <HalDisplay.h>
 #include <cstring>
 #include "esp_heap_caps.h"
@@ -65,7 +67,45 @@ constexpr int progressBarMarginTop = 1;
 constexpr int progressBarBottomGap = 5;      // 进度条距屏幕底部间距（与 EPUB 一致）
 constexpr int progressBarTextGap = 1;        // 文字底部距进度条顶部间距（与 EPUB 一致）
 constexpr size_t CHUNK_SIZE = 8 * 1024;           // default per-call read window
-constexpr size_t kMaxPageReadBytes = 48 * 1024;  // hard cap for first-page adaptive buffer (heap; no PSRAM)
+constexpr size_t kMaxPageReadBytes = 48 * 1024;  // hard cap for first-page adaptive buffer
+
+// Murphy M4 keeps reader windows in PSRAM, but the SD/SPI path may require an
+// internal DMA-capable destination. Bound that scarce memory to <=4 KiB and
+// copy each slice into the CPU-owned destination. Other boards keep the old
+// direct-read path.
+bool readTxtContentWithInternalBounce(Txt& source, uint8_t* dest, size_t offset, size_t len) {
+  if (!dest && len > 0) return false;
+  if (len == 0) return true;
+#ifdef CROSSPOINT_MURPHY_M4
+  size_t bounceSize = len < 4096 ? len : 4096;
+  uint8_t* bounce = nullptr;
+  while (!bounce && bounceSize >= 512) {
+    bounce = static_cast<uint8_t*>(
+        heap_caps_malloc(bounceSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+    if (!bounce) bounceSize /= 2;
+  }
+  if (!bounce) {
+    Serial.printf("[%lu] [TRS] SD bounce allocation failed len=%zu\n", millis(), len);
+    return false;
+  }
+
+  size_t done = 0;
+  bool ok = true;
+  while (done < len) {
+    const size_t n = (len - done < bounceSize) ? (len - done) : bounceSize;
+    if (!source.readContent(bounce, offset + done, n, false)) {
+      ok = false;
+      break;
+    }
+    std::memcpy(dest + done, bounce, n);
+    done += n;
+  }
+  heap_caps_free(bounce);
+  return ok;
+#else
+  return source.readContent(dest, offset, len, false);
+#endif
+}
 
 // Cache file magic and version
 constexpr uint32_t CACHE_MAGIC = 0x54585449;  // "TXTI"
@@ -407,12 +447,14 @@ void TxtReaderActivity::onEnter() {
     SETTINGS.saveToFile();
   }
 
+  M4HeapAudit::snapshot("txt_reader_before_task");
   xTaskCreate(&TxtReaderActivity::taskTrampoline, "TxtReaderActivityTask",
               8192,               // Stack size (increased for font loading + page indexing)
               this,               // Parameters
               1,                  // Priority
               &displayTaskHandle  // Task handle
   );
+  M4HeapAudit::snapshot("txt_reader_after_task");
 }
 
 void TxtReaderActivity::waitPhysicalEpdIdle(uint32_t maxMs) {
@@ -457,6 +499,7 @@ void TxtReaderActivity::onExit() {
     vSemaphoreDelete(renderingMutex);
     renderingMutex = nullptr;
   }
+  M4HeapAudit::snapshot("txt_reader_after_task_delete");
   pageOffsets.clear();
   currentPageLines.clear();
   APP_STATE.readerActivityLoadCount = 0;
@@ -2316,9 +2359,9 @@ void TxtReaderActivity::buildPageIndex(size_t beginByte, size_t endByte) {
   
   // 章节小于 32KB 时一次性读入内存（ESP32-C3 有 320KB RAM）
   if (chapterSize > 0 && chapterSize <= 32 * 1024) {
-    chapterBuf = static_cast<uint8_t*>(malloc(chapterSize + 1));
+    chapterBuf = static_cast<uint8_t*>(M4Psram::alloc(chapterSize + 1));
     if (chapterBuf) {
-      if (txt->readContent(chapterBuf, beginByte, chapterSize, false)) {
+      if (readTxtContentWithInternalBounce(*txt, chapterBuf, beginByte, chapterSize)) {
         chapterBuf[chapterSize] = '\0';
         useChapterBuf = true;
         Serial.printf("[%lu] [TRS] Chapter loaded to RAM: %zu bytes\n", millis(), chapterSize);
@@ -2681,12 +2724,12 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, size_t endOffset, std::v
     if (endOffset > offset) {
       chunkSize = std::min(chunkSize, endOffset - offset);
     }
-    buffer = static_cast<uint8_t*>(malloc(chunkSize + 1));
+    buffer = static_cast<uint8_t*>(M4Psram::alloc(chunkSize + 1));
     if (!buffer) {
       Serial.printf("[%lu] [TRS] Failed to allocate %zu bytes (readCap=%zu)\n", millis(), chunkSize, readCap);
       return false;
     }
-    if (!txt->readContent(buffer, offset, chunkSize, false)) {
+    if (!readTxtContentWithInternalBounce(*txt, buffer, offset, chunkSize)) {
       free(buffer);
       return false;
     }
@@ -2700,8 +2743,8 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, size_t endOffset, std::v
   const bool isGbk = txt->isGbkEncoding();
   const bool isUtf16 = txt->isUtf16Encoding();
   const bool mappedDecode = isGbk || isUtf16;
-  std::vector<uint8_t> decodedOwned;
-  std::vector<M4TxtEncoding::CpBoundary> cpMap;
+  M4Psram::Buffer<uint8_t> decodedOwned;
+  M4Psram::Buffer<M4TxtEncoding::CpBoundary> cpMap;
   size_t decodeWindowPos = offset;   // absolute raw base of map rawEnd
   size_t mappedExactNext = offset;   // fallback raw end of last complete CP in window
   // Raw window facts (for EOF / complete-line checks — never mix with UTF-8 indices)
@@ -2733,8 +2776,12 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, size_t endOffset, std::v
     const size_t rawPayload = rawChunkLen - bomSkipInChunk;
     const size_t outCap = rawPayload * 3 + 16;
     const size_t mapCap = rawPayload + 4;
-    decodedOwned.resize(outCap);
-    cpMap.resize(mapCap);
+    if (!decodedOwned.resize(outCap) || !cpMap.resize(mapCap)) {
+      Serial.printf("[%lu] [TRS] PSRAM decode scratch allocation failed raw=%zu out=%zu map=%zu\n",
+                    millis(), rawPayload, outCap, mapCap);
+      if (needFree) free(buffer);
+      return false;
+    }
     size_t outLen = 0, mapLen = 0;
     M4TxtEncoding::StreamDecoder dec;
     dec.reset(enc);
