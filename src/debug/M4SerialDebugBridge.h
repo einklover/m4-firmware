@@ -44,6 +44,8 @@ struct StatusSnapshot {
 
 struct HostHooks {
   std::function<StatusSnapshot()> status;
+  // Full UI text dump for automation (JSON object string). Prefer this over OCR.
+  std::function<std::string()> uiDump;
   std::function<void()> goHome;
   // Open the native file-transfer activity.  The hook is intentionally
   // separate from goHome so a USB command can present the same UI as the

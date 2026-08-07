@@ -64,7 +64,16 @@ class HalDisplay {
   void waveformLabBaseline(const uint8_t* frame);
   // Waveform Lab: windowed diff refresh (strip-by-strip page-turn animation).
   uint32_t waveformLabRefreshWindow(const uint8_t* prev, const uint8_t* next, const uint8_t* lut,
-                                    uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+                                    uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                    bool syncAfter = true);
+  uint32_t waveformLabRefreshWindowBufs(const uint8_t* redWin, const uint8_t* bwWin, const uint8_t* lut,
+                                        uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+  // Dual-dose strip pipeline: writeDiff → activate → equalize (selective).
+  void waveformLabWriteDiffWindow(const uint8_t* prev, const uint8_t* next, uint16_t x, uint16_t y, uint16_t w,
+                                  uint16_t h);
+  uint32_t waveformLabActivate(const uint8_t* lut = nullptr);
+  void waveformLabEqualizeWindow(const uint8_t* frame, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+  void setCustomLUT(bool enabled, const unsigned char* lutData = nullptr);
 
  private:
   EInkDisplay einkDisplay;

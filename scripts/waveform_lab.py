@@ -232,7 +232,13 @@ def main() -> None:
     p = sub.add_parser("wipewin")
     p.add_argument("prev")
     p.add_argument("next")
-    p.add_argument("--steps", type=int, default=4)
+    p.add_argument("--steps", type=int, default=8,
+                   help="advance count (= refresh count; default 8)")
+    p.add_argument("--tail", type=int, default=0, help="ghost-clear tail ms (0=off)")
+    p.add_argument("--mult", type=int, default=1,
+                   help="window width in step units (default 1; e.g. 8 = 8 steps wide)")
+    p.add_argument("--dir", type=int, default=0,
+                   help="0=R→L 1=L→R 2=B→T 3=T→B")
     p = sub.add_parser("settle")
     p.add_argument("prev")
     p.add_argument("next")
@@ -287,7 +293,8 @@ def main() -> None:
         print(json.dumps(r, ensure_ascii=False))
     elif args.cmd == "wipewin":
         r = c.request({"op": "lut_wipe", "prev": args.prev, "next": args.next,
-                       "steps": args.steps}, timeout=120)
+                       "steps": args.steps, "tail_ms": args.tail, "win_mult": args.mult,
+                       "dir": args.dir}, timeout=120)
         print(json.dumps(r, ensure_ascii=False))
     elif args.cmd == "settle":
         r = c.request({"op": "lut_settle", "prev": args.prev, "next": args.next}, timeout=120)

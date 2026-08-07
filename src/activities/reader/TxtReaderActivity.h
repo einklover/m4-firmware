@@ -13,6 +13,7 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderMenuActivity.h"
 #include "activities/ActivityWithSubactivity.h"
+#include "util/M4ContentProviderContract.h"
 
 class TxtReaderActivity final : public ActivityWithSubactivity {
  public:
@@ -194,6 +195,10 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   bool pluginPendingHalfFlush_ = false;
   // Provider next-chapter overlay (footer/status); empty when idle.
   std::string providerOverlayMsg_;
+  // Last overlay state that drove a physical refresh. Only a state transition
+  // (Missing→Fetching→Error/Ready) repaints the panel; pct-only churn updates
+  // providerOverlayMsg_ in memory without a full-frame differential.
+  M4ContentProvider::ChapterReady providerOverlayState_ = M4ContentProvider::ChapterReady::Ready;
   bool providerPrefetchRequested_ = false;
   bool tryProviderNextChapterAdvance();  // last-page next / seamless open
   void providerIdlePrefetchNext();
@@ -206,10 +211,19 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   // True while finishPhysicalDisplay / plugin half is on the panel (SPI busy).
   // Display task vs UI task: atomic, not volatile (ordering + visibility).
   std::atomic<bool> physicalEpdBusy_{false};
+  bool firstPhysicalShown_ = false;  // first content page has been driven to panel
+  // Enter/return to reader: flush pure white first so page-turn anim and FAST
+  // never diff against the previous activity (shelf/menu/loading residual).
+  bool entryWhiteSeedPending_ = false;
+  // Last body page that received a physical EPD drive. Same-page buffer updates
+  // (status "1/?"→"1/20", footer overlay churn) must NOT FAST-diff again —
+  // that was the residual/ghost buildup while progressive index ran.
+  int lastPhysicalBodyPage_ = -1;
   // Set on onExit / openMenu so display task stops starting new frames.
   std::atomic<bool> suppressDisplay_{false};
   void finishPhysicalDisplay();  // displayBuffer + optional AA (no state lock)
   void waitPhysicalEpdIdle(uint32_t maxMs = 2500);
+  void armEntryWhiteSeed();  // white absolute → then first page (anim from white)
 
   // Deferred nested-menu teardown (requestExitSubActivity + apply after pump).
   bool deferredMenuApply_ = false;

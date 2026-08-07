@@ -25,5 +25,9 @@ class Activity {
   virtual bool preventAutoSleep() { return false; }
   virtual bool isReaderActivity() const { return false; }
   virtual bool isHomeActivity() const { return false; }
+  // Structured UI dump for m4adb `ui` (JSON object body, no outer braces required
+  // to be complete alone — implementors return a full JSON object string).
+  // Used for automation without OCR/screenshot text recognition.
+  virtual std::string debugUiJson() { return "{}"; }
   const std::string& getName() const { return name; }
 };

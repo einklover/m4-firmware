@@ -490,13 +490,45 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
              "\"sd_ok\":%s,\"screen_w\":%d,\"screen_h\":%d,\"orientation\":%d,"
              "\"wifi_connected\":%s,\"wifi_status\":%d,\"wifi_ssid\":\"%s\",\"wifi_ip\":\"%s\","
              "\"wifi_rssi\":%d,\"caps\":[\"install\",\"install_http\",\"wifi_status\",\"wifi_prepare\","
-             "\"wifi_transfer\",\"sd_probe\",\"launch\",\"tap\",\"key\",\"screenshot\",\"logs\"]}",
+             "\"wifi_transfer\",\"sd_probe\",\"sd_read\",\"launch\",\"tap\",\"key\",\"screenshot\","
+             "\"logs\",\"ui\"]}",
              op, kProtocolVersion, st.firmwareVersion ? st.firmwareVersion : "", activityCopy_, appIdCopy_,
              static_cast<unsigned>(st.freeHeap), static_cast<unsigned>(st.minFreeHeap),
              static_cast<unsigned>(st.freePsram), st.sdOk ? "true" : "false", st.screenW, st.screenH,
              st.orientation, wifiConnected ? "true" : "false", static_cast<int>(WiFi.status()), wifiSsidSafe,
              wifiIpSafe, wifiRssi);
     replyOk(reqId, out);
+    return;
+  }
+
+  // Structured on-screen / plugin state for automation — no OCR required.
+  // Returns activity + active_app + nested ui dump (failed/error/screen/list).
+  if (strcmp(op, "ui") == 0) {
+    StatusSnapshot st{};
+    if (hooks_.status) st = hooks_.status();
+    strncpy(activityCopy_, st.activity ? st.activity : "", sizeof(activityCopy_) - 1);
+    activityCopy_[sizeof(activityCopy_) - 1] = 0;
+    strncpy(appIdCopy_, st.activeAppId ? st.activeAppId : "", sizeof(appIdCopy_) - 1);
+    appIdCopy_[sizeof(appIdCopy_) - 1] = 0;
+    std::string dump = "{}";
+    if (hooks_.uiDump) {
+      dump = hooks_.uiDump();
+      if (dump.empty()) dump = "{}";
+    }
+    // replyOk b64 buffer is ~1400 chars → keep raw JSON well under ~1000 B.
+    if (dump.size() > 850) {
+      dump.resize(850);
+      while (!dump.empty() && dump.back() != '}') dump.pop_back();
+      if (dump.empty() || dump.back() != '}') dump += '}';
+    }
+    char head[200];
+    snprintf(head, sizeof(head),
+             "{\"op\":\"ui\",\"activity\":\"%s\",\"active_app\":\"%s\",\"ui\":", activityCopy_, appIdCopy_);
+    std::string out = head;
+    out += dump;
+    out += '}';
+    if (out.size() > 1000) out.resize(1000);
+    replyOk(reqId, out.c_str());
     return;
   }
 
@@ -565,6 +597,83 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
              p.remove ? "true" : "false", p.failed ? p.failed : "", static_cast<unsigned long long>(SdMan.sdTotalBytes()),
              static_cast<unsigned long long>(SdMan.sdUsedBytes()), static_cast<unsigned>(SdMan.lastFatType()));
     replyOk(reqId, out, true);
+    return;
+  }
+
+  // Bounded SD text/file pull over USB (no Wi-Fi). Only /apps_data/** and
+  // /apps_inbox/** — for plugin error.log and install diagnostics.
+  if (strcmp(op, "sd_read") == 0) {
+    const char* pathIn = doc["path"] | "";
+    int offset = doc["offset"] | -1;  // -1 = read tail
+    int maxn = doc["max"] | 400;
+    if (maxn < 1) maxn = 1;
+    if (maxn > 400) maxn = 400;  // keep reply under serial line budget
+    if (!pathIn || !pathIn[0]) {
+      replyErr(reqId, "bad_path", "缺少 path");
+      return;
+    }
+    // Normalize: allow "apps_data/..." or "/apps_data/..."
+    char abs[192];
+    if (pathIn[0] == '/') {
+      snprintf(abs, sizeof(abs), "%s", pathIn);
+    } else {
+      snprintf(abs, sizeof(abs), "/%s", pathIn);
+    }
+    // Reject traversal / absolute escapes outside allow-list.
+    if (std::strstr(abs, "..") != nullptr) {
+      replyErr(reqId, "bad_path", "路径非法");
+      return;
+    }
+    const bool okRoot = (std::strncmp(abs, "/apps_data/", 11) == 0) ||
+                        (std::strncmp(abs, "/apps_inbox/", 12) == 0) ||
+                        (std::strcmp(abs, "/apps_data") == 0) || (std::strcmp(abs, "/apps_inbox") == 0);
+    if (!okRoot) {
+      replyErr(reqId, "forbidden", "仅允许 apps_data 或 apps_inbox");
+      return;
+    }
+    if (!SdMan.ready()) {
+      replyErr(reqId, "sd_not_ready", "SD 未就绪");
+      return;
+    }
+    if (!SdMan.exists(abs)) {
+      replyErr(reqId, "missing", "文件不存在");
+      return;
+    }
+    FsFile f;
+    if (!SdMan.openFileForRead("M4Dbg", abs, f)) {
+      replyErr(reqId, "open_failed", "无法打开文件");
+      return;
+    }
+    const size_t fsz = static_cast<size_t>(f.fileSize());
+    size_t off = 0;
+    if (offset < 0) {
+      off = (fsz > static_cast<size_t>(maxn)) ? (fsz - static_cast<size_t>(maxn)) : 0;
+    } else {
+      off = static_cast<size_t>(offset);
+      if (off > fsz) off = fsz;
+    }
+    size_t want = static_cast<size_t>(maxn);
+    if (off + want > fsz) want = fsz - off;
+    if (off > 0) f.seek(off);
+    uint8_t raw[400];
+    size_t got = 0;
+    while (got < want) {
+      const int n = f.read(raw + got, want - got);
+      if (n <= 0) break;
+      got += static_cast<size_t>(n);
+    }
+    f.close();
+    char b64[560];
+    M4SerialDebugPolicy::b64Encode(raw, got, b64, sizeof(b64));
+    char pathSafe[160];
+    copyJsonSafe(abs, pathSafe, sizeof(pathSafe));
+    char out[900];
+    snprintf(out, sizeof(out),
+             "{\"op\":\"sd_read\",\"ok\":true,\"path\":\"%s\",\"size\":%u,\"offset\":%u,"
+             "\"n\":%u,\"eof\":%s,\"data_b64\":\"%s\"}",
+             pathSafe, static_cast<unsigned>(fsz), static_cast<unsigned>(off), static_cast<unsigned>(got),
+             (off + got >= fsz) ? "true" : "false", b64);
+    replyOk(reqId, out);
     return;
   }
 
@@ -646,19 +755,24 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
   if (strcmp(op, "lut_wipe") == 0) {
     const char* prev = doc["prev"] | "";
     const char* next = doc["next"] | "";
-    const int steps = doc["steps"] | 4;
+    const int steps = doc["steps"] | 8;
+    const uint32_t tailMs = doc["tail_ms"] | 0;
+    const int winMult = doc["win_mult"] | 1;  // window width in step units
+    const int dir = doc["dir"] | 0;
     if (!prev[0] || !next[0]) {
       replyErr(reqId, "bad_path", "prev/next 路径必填");
       return;
     }
-    const uint32_t ms = M4WaveformLab::runAnimateWindow(prev, next, steps);
+    const uint32_t ms = M4WaveformLab::runAnimateWindow(prev, next, steps, tailMs, winMult, dir);
     if (ms == 0) {
       replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
       return;
     }
     char out[128];
-    snprintf(out, sizeof(out), "{\"op\":\"lut_wipe\",\"ok\":true,\"ms\":%u,\"steps\":%d}",
-             static_cast<unsigned>(ms), steps);
+    snprintf(out, sizeof(out),
+             "{\"op\":\"lut_wipe\",\"ok\":true,\"ms\":%u,\"steps\":%d,\"win_mult\":%d,"
+             "\"dir\":%d,\"refreshes\":%d}",
+             static_cast<unsigned>(ms), steps, winMult, dir, steps);
     replyOk(reqId, out);
     return;
   }

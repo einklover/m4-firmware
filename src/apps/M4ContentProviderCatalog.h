@@ -47,10 +47,16 @@ inline bool resolveRow(M4FileRows::FileRowSource& source,
   out = {};
   errorOut.clear();
   if (rawLineOut) rawLineOut->clear();
-  if (catalog.kind != ChapterCatalogKind::FileRows || index0 < 0 ||
-      static_cast<size_t>(index0) >= catalog.chapterCount || !source.isOpen() ||
-      source.rowCount() != catalog.chapterCount) {
+  // Accept index within both registered count and on-disk row count. Meta
+  // count can lag/lead the file briefly (TOC rewrite / incomplete .ok); a
+  // hard equality check made next-chapter resolve always fail for those books.
+  if (catalog.kind != ChapterCatalogKind::FileRows || index0 < 0 || !source.isOpen()) {
     errorOut = "bad_catalog";
+    return false;
+  }
+  if (static_cast<size_t>(index0) >= catalog.chapterCount ||
+      static_cast<size_t>(index0) >= source.rowCount()) {
+    errorOut = "row_out_of_range";
     return false;
   }
   const int page = index0 / source.pageSize() + 1;

@@ -170,6 +170,10 @@ class Client:
     def status(self) -> dict:
         return self.request({"op": "status"}, timeout=5)
 
+    def ui(self) -> dict:
+        """Structured on-screen / plugin state (prefer over OCR for automation)."""
+        return self.request({"op": "ui"}, timeout=8)
+
     def wifi_status(self) -> dict:
         """Read Wi-Fi/IP state without changing the radio or credentials."""
         return self.request({"op": "wifi_status"}, timeout=5)
@@ -189,6 +193,28 @@ class Client:
     def sd_probe(self) -> dict:
         """Run a bounded write/sync/read/delete probe on the device SD card."""
         return self.request({"op": "sd_probe"}, timeout=15)
+
+    def sd_read(
+        self,
+        path: str,
+        offset: int = -1,
+        max_bytes: int = 400,
+        timeout: float = 15.0,
+    ) -> dict:
+        """Read a bounded slice of an SD file over USB (apps_data / apps_inbox only).
+
+        offset=-1 reads the tail (default).  Device caps max_bytes at 400.
+        Response includes data_b64, size, offset, n, eof.
+        """
+        return self.request(
+            {
+                "op": "sd_read",
+                "path": path,
+                "offset": int(offset),
+                "max": int(max_bytes),
+            },
+            timeout=max(5.0, float(timeout)),
+        )
 
     def install(
         self,

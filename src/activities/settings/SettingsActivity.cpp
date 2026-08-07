@@ -356,8 +356,13 @@ void SettingsActivity::toggleCurrentSetting() {
     const bool currentValue = SETTINGS.*(setting.valuePtr);
     SETTINGS.*(setting.valuePtr) = !currentValue;
   } else if (setting.type == SettingType::ENUM && setting.valuePtr != nullptr) {
-    const uint8_t currentValue = SETTINGS.*(setting.valuePtr);
-    SETTINGS.*(setting.valuePtr) = (currentValue + 1) % static_cast<uint8_t>(setting.enumValues.size());
+    // Treat the stored field as an index. Clamp first so a corrupt/out-of-range
+    // value (or a non-index field bound by mistake) cannot walk off enumValues.
+    const size_t n = setting.enumValues.size();
+    if (n == 0) return;
+    uint8_t currentValue = SETTINGS.*(setting.valuePtr);
+    if (currentValue >= static_cast<uint8_t>(n)) currentValue = 0;
+    SETTINGS.*(setting.valuePtr) = static_cast<uint8_t>((currentValue + 1) % n);
 #ifdef CROSSPOINT_X3
     // 切换到全局生效时，自动开启晃动翻页
     if (setting.valuePtr == &CrossPointSettings::tiltScope &&
@@ -366,8 +371,11 @@ void SettingsActivity::toggleCurrentSetting() {
     }
 #endif
   } else if (setting.type == SettingType::ENUM && setting.valueGetter && setting.valueSetter) {
+    const size_t n = setting.enumValues.size();
+    if (n == 0) return;
     const uint8_t currentIndex = setting.valueGetter();
-    setting.valueSetter((currentIndex + 1) % static_cast<uint8_t>(setting.enumValues.size()));
+    const uint8_t safe = (currentIndex < static_cast<uint8_t>(n)) ? currentIndex : 0;
+    setting.valueSetter(static_cast<uint8_t>((safe + 1) % n));
 } else if (setting.type == SettingType::VALUE && setting.signedValuePtr != nullptr) {
     // 有符号数值类型：打开数字选择器
     const int currentValue = SETTINGS.*(setting.signedValuePtr);
@@ -615,8 +623,15 @@ void SettingsActivity::render() const {
           const bool value = SETTINGS.*(settings[i].valuePtr);
           valueText = value ? L(Str::kOn) : L(Str::kOff);
         } else if (settings[i].type == SettingType::ENUM && settings[i].valuePtr != nullptr) {
+          // Bound-check: raw SETTINGS fields must be indices into enumValues.
+          // Binding a non-index field (e.g. LUT frame-rate byte 0x88) OOBs and
+          // reboots when the System category is rendered.
           const uint8_t value = SETTINGS.*(settings[i].valuePtr);
-          valueText = settings[i].enumValues[value];
+          if (value < static_cast<uint8_t>(settings[i].enumValues.size())) {
+            valueText = settings[i].enumValues[value];
+          } else {
+            valueText = "?";
+          }
         } else if (settings[i].type == SettingType::ENUM && settings[i].valueGetter) {
           const uint8_t idx = settings[i].valueGetter();
           if (idx < static_cast<uint8_t>(settings[i].enumValues.size())) {

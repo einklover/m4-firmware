@@ -755,3 +755,34 @@ void AppRuntimeActivity::renderError() {
   M4UiText::drawCentered(renderer, UI_10_FONT_ID, 360, hint);
   renderer.displayBuffer();
 }
+
+std::string AppRuntimeActivity::debugUiJson() {
+  std::string err;
+  copyError(err);
+  std::string out = "{\"kind\":\"app_runtime\",\"app_id\":\"";
+  out += app_.id;
+  out += "\",\"app_name\":\"";
+  out += app_.name;
+  out += "\",\"failed\":";
+  out += failed_.load(std::memory_order_relaxed) ? "true" : "false";
+  out += ",\"ready\":";
+  out += ready_.load(std::memory_order_relaxed) ? "true" : "false";
+  out += ",\"error\":\"";
+  for (unsigned char c : err) {
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+      out.push_back(static_cast<char>(c));
+    } else if (c < 0x20) {
+      char hex[8];
+      snprintf(hex, sizeof(hex), "\\u%04x", c);
+      out += hex;
+    } else {
+      out.push_back(static_cast<char>(c));
+    }
+  }
+  out += "\",\"plugin\":";
+  // Nested plugin dump (already a JSON object).
+  out += host_.debugUiJson();
+  out += '}';
+  return out;
+}

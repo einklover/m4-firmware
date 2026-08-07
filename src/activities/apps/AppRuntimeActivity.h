@@ -27,6 +27,8 @@ class AppRuntimeActivity final : public ActivityWithSubactivity {
   void onEnter() override;
   void onExit() override;
   void loop() override;
+  // m4adb `ui`: failed/error + Lua screen/status/message + host list scene.
+  std::string debugUiJson() override;
 
  private:
   M4xInstalledApp app_;

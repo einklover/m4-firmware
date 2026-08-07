@@ -210,13 +210,24 @@ inline const char* streamErrorString(StreamError e) {
 }
 
 // Constant-memory transfer used by all dl.* body paths. expectedSize ==
-// SIZE_MAX means an until-close/chunked body; otherwise early EOF is rejected.
+// SIZE_MAX / (size_t)-1 means an until-close/chunked body; otherwise early
+// EOF is rejected.
+//
+// HTTP keep-alive + Transfer-Encoding: chunked is the common case for CDN
+// bookstore APIs: after the last chunk is delivered, available()==0 but
+// connected() stays true, so a pure "wait for disconnect" loop times out
+// with a full body still buffered.  Treat ~400ms of quiet after progress as
+// EOF for until-close transfers.
 inline StreamResult stream(StreamSource& source, StreamSink& sink, size_t cap,
                            size_t expectedSize, uint32_t timeoutMs,
                            const StreamRuntime& runtime) {
   StreamResult out;
   uint8_t buf[2048];
   const uint32_t start = runtime.nowMs ? runtime.nowMs() : 0;
+  uint32_t lastProgressMs = start;
+  // Quiet window after last byte.  Too short → mid-transfer pause false EOF;
+  // too long → slow UI.  700ms covers CDN chunked keep-alive end.
+  constexpr uint32_t kIdleEofMs = 700;
   for (;;) {
     if (runtime.cancelled && runtime.cancelled()) {
       out.error = StreamError::Cancelled;
@@ -256,9 +267,16 @@ inline StreamResult stream(StreamSource& source, StreamSink& sink, size_t cap,
         return out;
       }
       out.bytes += static_cast<size_t>(n);
+      if (runtime.nowMs) lastProgressMs = runtime.nowMs();
       continue;
     }
     if (n == 0) {
+      // Would-block / no data.  Keep-alive chunked bodies end with quiet
+      // sockets that never disconnect — accept idle EOF after progress.
+      if (expectedSize == static_cast<size_t>(-1) && out.bytes > 0 && runtime.nowMs &&
+          static_cast<uint32_t>(runtime.nowMs() - lastProgressMs) >= kIdleEofMs) {
+        return out;
+      }
       if (runtime.wait) runtime.wait();
       continue;
     }

@@ -89,6 +89,30 @@ void HalDisplay::waveformLabBaseline(const uint8_t* frame) {
 }
 
 uint32_t HalDisplay::waveformLabRefreshWindow(const uint8_t* prev, const uint8_t* next, const uint8_t* lut,
-                                              uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
-  return einkDisplay.waveformLabRefreshWindow(prev, next, lut, x, y, w, h);
+                                              uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                              bool syncAfter) {
+  return einkDisplay.waveformLabRefreshWindow(prev, next, lut, x, y, w, h, syncAfter);
+}
+
+uint32_t HalDisplay::waveformLabRefreshWindowBufs(const uint8_t* redWin, const uint8_t* bwWin,
+                                                  const uint8_t* lut, uint16_t x, uint16_t y, uint16_t w,
+                                                  uint16_t h) {
+  return einkDisplay.waveformLabRefreshWindowBufs(redWin, bwWin, lut, x, y, w, h);
+}
+
+void HalDisplay::waveformLabWriteDiffWindow(const uint8_t* prev, const uint8_t* next, uint16_t x, uint16_t y,
+                                            uint16_t w, uint16_t h) {
+  einkDisplay.waveformLabWriteDiffWindow(prev, next, x, y, w, h);
+}
+
+uint32_t HalDisplay::waveformLabActivate(const uint8_t* lut) {
+  return einkDisplay.waveformLabActivate(lut);
+}
+
+void HalDisplay::waveformLabEqualizeWindow(const uint8_t* frame, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  einkDisplay.waveformLabEqualizeWindow(frame, x, y, w, h);
+}
+
+void HalDisplay::setCustomLUT(bool enabled, const unsigned char* lutData) {
+  einkDisplay.setCustomLUT(enabled, lutData);
 }

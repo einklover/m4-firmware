@@ -245,6 +245,38 @@ def cmd_sd_probe(args: argparse.Namespace) -> int:
         c.close()
 
 
+def cmd_sd_read(args: argparse.Namespace) -> int:
+    """Pull a small SD file slice over USB (plugin error.log etc.)."""
+    import base64
+
+    c = _open_client(args)
+    try:
+        res = c.sd_read(args.path, offset=args.offset, max_bytes=args.max)
+        # Decode for human-readable stdout; raw JSON also available via --json.
+        if getattr(args, "json", False):
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+        b64 = res.get("data_b64") or ""
+        raw = base64.b64decode(b64) if b64 else b""
+        meta = (
+            f"# path={res.get('path')} size={res.get('size')} "
+            f"offset={res.get('offset')} n={res.get('n')} eof={res.get('eof')}\n"
+        )
+        sys.stdout.write(meta)
+        try:
+            sys.stdout.write(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            sys.stdout.buffer.write(raw)
+        if raw and not raw.endswith(b"\n"):
+            sys.stdout.write("\n")
+        return 0
+    except BridgeError as e:
+        print(f"错误 {e.key}: {e.message}", file=sys.stderr)
+        return 1
+    finally:
+        c.close()
+
+
 def cmd_wifi_status(args: argparse.Namespace) -> int:
     c = _open_client(args)
     try:
@@ -422,6 +454,19 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
         c.close()
 
 
+def cmd_ui(args: argparse.Namespace) -> int:
+    """Dump structured UI text/state for automation (no OCR)."""
+    c = _open_client(args)
+    try:
+        print(json.dumps(c.ui(), ensure_ascii=False, indent=2))
+        return 0
+    except BridgeError as e:
+        print(f"错误 {e.key}: {e.message}", file=sys.stderr)
+        return 1
+    finally:
+        c.close()
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     c = _open_client(args)
     print("捕获串口日志（Ctrl-C 结束）…", flush=True)
@@ -456,6 +501,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
             if op == "help":
                 print(
                     "ping | status | wifi_status | wifi_prepare | wifi_transfer | sd_probe | "
+                    "sd_read <path> | "
                     "install <m4x|源码目录> | sync <源码目录> | "
                     "launch <app_id> | screenshot <pbm> | tap <x> <y> | "
                     "key <name> | back | home | quit"
@@ -678,6 +724,31 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("ping", help="握手")
     sub.add_parser("status", help="状态快照")
     sub.add_parser("sd_probe", help="SD 卡写入/同步/读取/删除探针")
+    psr = sub.add_parser(
+        "sd_read",
+        help="经 USB 读取 SD 文件片段（仅 apps_data/apps_inbox，默认 tail 400B）",
+    )
+    psr.add_argument(
+        "path",
+        help="如 apps_data/com.jjwxc.client/logs/error.log",
+    )
+    psr.add_argument(
+        "--offset",
+        type=int,
+        default=-1,
+        help="字节偏移；默认 -1=从文件尾部读",
+    )
+    psr.add_argument(
+        "--max",
+        type=int,
+        default=400,
+        help="最多读取字节（设备上限 400）",
+    )
+    psr.add_argument(
+        "--json",
+        action="store_true",
+        help="输出原始 JSON（含 data_b64）",
+    )
     pi = sub.add_parser("install", help="安装 .m4x 或源目录（单次连接，含整体超时）")
     pi.add_argument("path")
     pi.add_argument(
@@ -735,6 +806,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("back", help="注入 Back")
     pss = sub.add_parser("screenshot", help="导出逻辑 PBM 截图")
     pss.add_argument("output")
+    sub.add_parser(
+        "ui",
+        help="导出结构化界面状态 JSON（activity/screen/error/list，自动化优先用这个，无需 OCR）",
+    )
     sub.add_parser("logs", help="带时间戳捕获串口日志")
     sub.add_parser("shell", help="常驻串口交互会话（避免逐命令重连复位）")
     pr = sub.add_parser("run", help="执行 journey JSON")
@@ -761,6 +836,7 @@ def main(argv: list[str] | None = None) -> int:
         "ping": cmd_ping,
         "status": cmd_status,
         "sd_probe": cmd_sd_probe,
+        "sd_read": cmd_sd_read,
         "wifi_status": cmd_wifi_status,
         "wifi_prepare": cmd_wifi_prepare,
         "wifi_transfer": cmd_wifi_transfer,
@@ -771,6 +847,7 @@ def main(argv: list[str] | None = None) -> int:
         "key": cmd_key,
         "back": cmd_back,
         "screenshot": cmd_screenshot,
+        "ui": cmd_ui,
         "logs": cmd_logs,
         "shell": cmd_shell,
         "run": cmd_run,

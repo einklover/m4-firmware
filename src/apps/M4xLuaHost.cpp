@@ -173,6 +173,28 @@ void configureTlsClient(WiFiClientSecure* secure, const M4xLuaHost* host) {
   secure->setHandshakeTimeout(30);
 }
 
+// Arduino HTTPClient::addHeader appends — a default UA + plugin UA yields two
+// User-Agent headers.  Some CDNs (jjwxc app-cdn) drop the connection on dual UA.
+// Only inject the host default when the caller did not supply one.
+static bool headerListHasUA(const std::vector<std::pair<std::string, std::string>>& headers) {
+  for (const auto& hv : headers) {
+    if (hv.first.empty()) continue;
+    const std::string low = M4xNetPolicy::toLowerAscii(hv.first);
+    if (low == "user-agent") return true;
+  }
+  return false;
+}
+static void applyHttpHeaders(HTTPClient& http,
+                             const std::vector<std::pair<std::string, std::string>>& headers,
+                             const char* defaultUa) {
+  if (defaultUa && defaultUa[0] && !headerListHasUA(headers)) {
+    http.addHeader("User-Agent", defaultUa);
+  }
+  for (const auto& hv : headers) {
+    if (!hv.first.empty()) http.addHeader(hv.first.c_str(), hv.second.c_str());
+  }
+}
+
 struct WifiHttpStream : M4xHttp::Stream {
   NetworkClient* client = nullptr;
   explicit WifiHttpStream(NetworkClient* c) : client(c) {}
@@ -408,10 +430,123 @@ int fsWriteChunk(void* ctx, const uint8_t* src, size_t n) {
 
 // ---- log / gui ----
 
+// Developer-mode SD error log (app data: logs/error.log). Caps size so a noisy
+// plugin cannot fill the card; rotates to error.log.prev once.
+constexpr size_t kPluginErrorLogMaxBytes = 128 * 1024;
+constexpr size_t kPluginErrorLogLineMax = 480;
+
+bool looksLikeErrorLogLine(const char* s) {
+  if (!s || !s[0]) return false;
+  // Cheap ASCII fold for keyword scan (UTF-8 multi-byte left intact).
+  char buf[256];
+  size_t n = 0;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p && n + 1 < sizeof(buf); ++p) {
+    buf[n++] = static_cast<char>((*p < 0x80) ? tolower(*p) : *p);
+  }
+  buf[n] = '\0';
+  static const char* kKeys[] = {"error", "fail", "oom", "panic", "exception", "fatal",
+                                "assert", "traceback", "low_mem", "err=", "err:", "timeout",
+                                "missing:", "denied", "bad_", "no_"};
+  for (const char* k : kKeys) {
+    if (std::strstr(buf, k) != nullptr) return true;
+  }
+  // Common CJK failure markers (no fold needed).
+  if (std::strstr(s, "失败") != nullptr || std::strstr(s, "错误") != nullptr) return true;
+  return false;
+}
+
+void appendPluginErrorLog(M4xLuaHost* h, const char* msg) {
+  if (!h || !msg || !msg[0]) return;
+  if (SETTINGS.developerSerialDebugEnabled == 0) return;
+  if (!hasPerm(h->app_, "filesystem.appdata")) return;
+
+  std::string dir = h->dataDir();
+  if (dir.empty()) return;
+  if (dir.back() != '/') dir += '/';
+  dir += "logs";
+  SdMan.mkdir(dir.c_str(), true);
+  const std::string path = dir + "/error.log";
+  const std::string prev = dir + "/error.log.prev";
+
+  // Rotate when over cap (best-effort; never throw into Lua).
+  if (SdMan.exists(path.c_str())) {
+    FsFile probe;
+    if (SdMan.openFileForRead("M4xLog", path.c_str(), probe)) {
+      const size_t sz = probe.fileSize();
+      probe.close();
+      if (sz >= kPluginErrorLogMaxBytes) {
+        if (SdMan.exists(prev.c_str())) SdMan.remove(prev.c_str());
+        SdMan.rename(path.c_str(), prev.c_str());
+      }
+    }
+  }
+
+  FsFile f = SdMan.open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND);
+  if (!f) {
+    // First create may race mkdir; retry once.
+    SdMan.mkdir(dir.c_str(), true);
+    f = SdMan.open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND);
+  }
+  if (!f) {
+    Serial.printf("[M4xLog] append fail path=%s\n", path.c_str());
+    return;
+  }
+
+  char head[48];
+  snprintf(head, sizeof(head), "[%lu] ", static_cast<unsigned long>(millis()));
+  f.write(reinterpret_cast<const uint8_t*>(head), std::strlen(head));
+
+  size_t len = std::strlen(msg);
+  if (len > kPluginErrorLogLineMax) len = kPluginErrorLogLineMax;
+  f.write(reinterpret_cast<const uint8_t*>(msg), len);
+  if (len == kPluginErrorLogLineMax) {
+    static const char kTrunc[] = "…";
+    f.write(reinterpret_cast<const uint8_t*>(kTrunc), sizeof(kTrunc) - 1);
+  }
+  static const char kNl[] = "\n";
+  f.write(reinterpret_cast<const uint8_t*>(kNl), 1);
+  f.sync();
+  f.close();
+}
+
+// log(msg [, level])
+// level: "error" | "err" | "info" (default). Serial always.
+// When 开发者选项 USB 串口调试 is ON: error lines also append to
+// apps_data/<app>/logs/error.log (and info lines that look like failures).
 int l_log(lua_State* L) {
   const char* s = luaL_checkstring(L, 1);
+  const char* level = "info";
+  if (lua_gettop(L) >= 2 && lua_isstring(L, 2)) {
+    level = lua_tostring(L, 2);
+    if (!level) level = "info";
+  }
   Serial.printf("[M4xApp] %s\n", s ? s : "");
+  auto* h = hostFromLua(L);
+  if (!h || SETTINGS.developerSerialDebugEnabled == 0) return 0;
+  bool asError = false;
+  if (level[0] == 'e' || level[0] == 'E') {
+    // error / err / ERROR
+    asError = true;
+  } else if (looksLikeErrorLogLine(s)) {
+    asError = true;
+  }
+  if (asError) appendPluginErrorLog(h, s ? s : "");
   return 0;
+}
+
+// logError(msg) — always treated as error for SD logging when developer mode on.
+int l_logError(lua_State* L) {
+  const char* s = luaL_checkstring(L, 1);
+  Serial.printf("[M4xApp][ERR] %s\n", s ? s : "");
+  auto* h = hostFromLua(L);
+  if (h) appendPluginErrorLog(h, s ? s : "");
+  return 0;
+}
+
+// sys.developerMode() -> bool  (设置→开发者选项→USB 串口调试)
+int l_sys_developerMode(lua_State* L) {
+  lua_pushboolean(L, SETTINGS.developerSerialDebugEnabled != 0 ? 1 : 0);
+  return 1;
 }
 
 int l_gui_width(lua_State* L) {
@@ -1997,13 +2132,11 @@ int l_net_request(lua_State* L) {
       break;
     }
 
-    http.addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xWeread/1.0");
     if (!hasHeaderCI("Referer")) {
       http.addHeader("Referer", "https://weread.qq.com/");
     }
-    for (const auto& hv : headerList) {
-      http.addHeader(hv.first.c_str(), hv.second.c_str());
-    }
+    applyHttpHeaders(http, headerList,
+                     "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xWeread/1.0");
 
     // Do not log Cookie / Authorization values.
     Serial.printf("[M4xNet] %s %s body=%u hop=%d\n", methodStr.c_str(), url.c_str(),
@@ -2304,13 +2437,11 @@ int l_net_extractPsvts(lua_State* L) {
       break;
     }
 
-    http.addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xWeread/1.0");
     if (!hasHeaderCI("Referer")) {
       http.addHeader("Referer", "https://weread.qq.com/");
     }
-    for (const auto& hv : headerList) {
-      http.addHeader(hv.first.c_str(), hv.second.c_str());
-    }
+    applyHttpHeaders(http, headerList,
+                     "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xWeread/1.0");
 
     Serial.printf("[M4xNet] extractPsvts GET %s hop=%d\n", url.c_str(), hop);
     const uint32_t requestStartedMs = millis();
@@ -3285,10 +3416,7 @@ bool dlStreamToFile(const std::string& url, const std::vector<std::pair<std::str
     err = "http_begin_failed";
     return false;
   }
-  http.addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xApp/1.0");
-  for (const auto& hv : headers) {
-    if (!hv.first.empty()) http.addHeader(hv.first.c_str(), hv.second.c_str());
-  }
+  applyHttpHeaders(http, headers, "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xApp/1.0");
   const int code = http.GET();
   if (code < 0) {
     err = "http_request_failed";
@@ -3485,6 +3613,21 @@ int l_dl_jsonGet(lua_State* L) {
                               netMaxBodyBytes());
   const uint32_t safeTimeout = M4xHostIo::Limits::timeoutMs(timeoutMs);
 
+  // Reclaim Lua + refuse TLS when internal heap is fragmented (same gate as
+  // net.request). Category booklist OOM used to surface as generic http fail.
+  lua_gc(L, LUA_GCCOLLECT, 0);
+  {
+    const size_t largestInternal =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (largestInternal < 40 * 1024) {
+      Serial.printf("[M4xNet] dl.jsonGet TLS skipped: internal largest=%u\n",
+                    static_cast<unsigned>(largestInternal));
+      lua_pushnil(L);
+      lua_pushstring(L, "oom");
+      return 2;
+    }
+  }
+
   // Stream response into a PSRAM-backed buffer.
   bool insecureRetried = false;
 retry_tls_json_get:
@@ -3509,10 +3652,11 @@ retry_tls_json_get:
     lua_pushstring(L, "http_begin_failed");
     return 2;
   }
-  http.addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xApp/1.0");
-  for (const auto& hv : headers) {
-    if (!hv.first.empty()) http.addHeader(hv.first.c_str(), hv.second.c_str());
-  }
+  // Extend wall *before* TLS/GET — long category fetches used to sit silent
+  // until timeout with dual-UA hangs (jjwxc app-cdn).
+  if (h) h->extendCallbackWallMs(safeTimeout + 12000);
+  Serial.printf("[M4xNet] dl.jsonGet begin %s\n", url);
+  applyHttpHeaders(http, headers, "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xApp/1.0");
   const int code = http.GET();
   if (code < 0) {
     http.end();
@@ -3520,6 +3664,7 @@ retry_tls_json_get:
       insecureRetried = true;
       goto retry_tls_json_get;
     }
+    Serial.printf("[M4xNet] dl.jsonGet GET fail code=%d\n", code);
     lua_pushnil(L);
     lua_pushstring(L, "http_request_failed");
     return 2;
@@ -3543,7 +3688,7 @@ retry_tls_json_get:
     lua_pushstring(L, "response_too_large");
     return 2;
   }
-  Serial.printf("[M4xNet] dl.jsonGet GET %s\n", url);
+  Serial.printf("[M4xNet] dl.jsonGet GET ok status=%d cl=%d\n", code, cl);
   NetBodyBuf body;
   const size_t initial = cl > 0 ? static_cast<size_t>(cl) : std::min<size_t>(cap, 16 * 1024);
   if (initial && !body.reserve(initial)) {
@@ -3572,6 +3717,51 @@ retry_tls_json_get:
                 static_cast<unsigned>(body.len), body.fromCaps ? 1 : 0);
   if (h) h->extendCallbackWallMs(4000);  // parse + table build may exceed the callback budget
 
+  // Keep-alive / idle-EOF can leave a few trailing bytes past the JSON value.
+  // Walk the outermost object/array so ArduinoJson does not see InvalidInput.
+  auto jsonSpanLen = [](const char* data, size_t len) -> size_t {
+    if (!data || len == 0) return 0;
+    size_t i = 0;
+    while (i < len && static_cast<unsigned char>(data[i]) <= 0x20) ++i;
+    if (i >= len) return 0;
+    const char open = data[i];
+    if (open != '{' && open != '[') return len;
+    const char close = (open == '{') ? '}' : ']';
+    int depth = 0;
+    bool inStr = false;
+    bool esc = false;
+    for (size_t j = i; j < len; ++j) {
+      const char c = data[j];
+      if (inStr) {
+        if (esc) {
+          esc = false;
+        } else if (c == '\\') {
+          esc = true;
+        } else if (c == '"') {
+          inStr = false;
+        }
+        continue;
+      }
+      if (c == '"') {
+        inStr = true;
+        continue;
+      }
+      if (c == open) {
+        ++depth;
+      } else if (c == close) {
+        --depth;
+        if (depth == 0) return j + 1;
+      }
+    }
+    return len;  // incomplete — let the parser report IncompleteInput
+  };
+  size_t parseLen = jsonSpanLen(body.data, body.len);
+  if (parseLen == 0) parseLen = body.len;
+  if (parseLen != body.len) {
+    Serial.printf("[M4xNet] dl.jsonGet trim body %u -> %u\n", static_cast<unsigned>(body.len),
+                  static_cast<unsigned>(parseLen));
+  }
+
   JsonDocument doc(
 #if defined(ARDUINO_ARCH_ESP32)
       PsramJsonAllocatorInstance()
@@ -3579,9 +3769,17 @@ retry_tls_json_get:
       ArduinoJson::detail::DefaultAllocator::instance()
 #endif
   );
-  const DeserializationError derr = deserializeJson(doc, body.data, body.len);
+  DeserializationError derr = deserializeJson(doc, body.data, parseLen);
+  if (derr && parseLen != body.len) {
+    // Fallback: try full buffer once more.
+    derr = deserializeJson(doc, body.data, body.len);
+  }
   if (derr) {
-    Serial.printf("[M4xNet] dl.jsonGet parse fail: %s\n", derr.c_str());
+    const unsigned head = body.len > 0 ? static_cast<unsigned char>(body.data[0]) : 0;
+    const unsigned tail =
+        body.len > 0 ? static_cast<unsigned char>(body.data[body.len - 1]) : 0;
+    Serial.printf("[M4xNet] dl.jsonGet parse fail: %s head=0x%02x tail=0x%02x len=%u\n",
+                  derr.c_str(), head, tail, static_cast<unsigned>(body.len));
     lua_pushnil(L);
     lua_pushstring(L, "json_parse_failed");
     return 2;
@@ -3791,10 +3989,9 @@ int l_dl_jsonToFile(lua_State* L) {
     lua_pushstring(L, "http_begin_failed");
     return 2;
   }
-  http.addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xApp/1.0");
-  for (const auto& hv : headers) {
-    if (!hv.first.empty()) http.addHeader(hv.first.c_str(), hv.second.c_str());
-  }
+  applyHttpHeaders(http, headers, "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xApp/1.0");
+  if (h) h->extendCallbackWallMs(safeTimeout + 12000);
+  Serial.printf("[M4xNet] dl.jsonToFile begin %s\n", url);
   const int code = method == "POST"
       ? http.POST(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(requestBody.data())),
                   requestBody.size())
@@ -4273,6 +4470,14 @@ bool callGlobal(lua_State* L, M4xLuaSandbox::Budget* budget, const char* fn, int
       errorOut = lua_tostring(L, -1) ? lua_tostring(L, -1) : "lua_error";
     }
     lua_pop(L, 1);
+    // Developer mode: persist Lua callback failures to SD (same gate as log()).
+    if (gHost && SETTINGS.developerSerialDebugEnabled != 0) {
+      std::string line = "lua:";
+      line += fn ? fn : "?";
+      line += " ";
+      line += errorOut;
+      appendPluginErrorLog(gHost, line.c_str());
+    }
     return false;
   }
   return true;
@@ -4518,7 +4723,17 @@ bool M4xLuaHost::start(GfxRenderer& renderer, const M4xInstalledApp& app, std::s
   M4xLuaSandbox::installHook(L, &budget_);
   openSafeLibs(L);
 
+  // Developer mode: mark log path so USB sd_read can confirm logging is armed.
+  if (SETTINGS.developerSerialDebugEnabled != 0) {
+    char boot[160];
+    snprintf(boot, sizeof(boot), "host_start app=%s log=apps_data/%s/logs/error.log", app.id.c_str(),
+             app.id.c_str());
+    appendPluginErrorLog(this, boot);
+    Serial.printf("[M4xLog] developer log armed path=%s/logs/error.log\n", dataDir_.c_str());
+  }
+
   lua_register(L, "log", l_log);
+  lua_register(L, "logError", l_logError);
 
   static const luaL_Reg guiRegs[] = {
       {"width", l_gui_width},
@@ -4545,6 +4760,7 @@ bool M4xLuaHost::start(GfxRenderer& renderer, const M4xInstalledApp& app, std::s
       {"memInfo", l_sys_memInfo},
       {"load", l_sys_load},
       {"fontInfo", l_sys_fontInfo},
+      {"developerMode", l_sys_developerMode},
       {nullptr, nullptr},
   };
   registerModule(L, "sys", sysRegs);
@@ -4845,6 +5061,95 @@ bool M4xLuaHost::callProviderPump(std::string& errorOut) {
 
 bool M4xLuaHost::loaderNeedsPump() const {
   return M4xProgressiveLoader::session().needsPump();
+}
+
+static void jsonEscapeAppend(std::string& out, const char* s) {
+  if (!s) return;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p; ++p) {
+    const unsigned char c = *p;
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+      out.push_back(static_cast<char>(c));
+    } else if (c < 0x20) {
+      char hex[8];
+      snprintf(hex, sizeof(hex), "\\u%04x", c);
+      out += hex;
+    } else {
+      out.push_back(static_cast<char>(c));
+    }
+  }
+}
+
+static void luaGlobalString(lua_State* L, const char* key, std::string& out) {
+  out.clear();
+  if (!L || !key) return;
+  lua_getglobal(L, key);
+  if (lua_isstring(L, -1)) {
+    const char* s = lua_tostring(L, -1);
+    if (s) out = s;
+  } else if (lua_isboolean(L, -1)) {
+    out = lua_toboolean(L, -1) ? "true" : "false";
+  } else if (lua_isnumber(L, -1)) {
+    out = std::to_string(lua_tonumber(L, -1));
+  }
+  lua_pop(L, 1);
+}
+
+std::string M4xLuaHost::debugUiJson() const {
+  // Compact JSON for m4adb automation (no screenshot OCR).
+  std::string out = "{\"lua\":";
+  auto* L = static_cast<lua_State*>(L_);
+  if (!L) {
+    out += "false}";
+    return out;
+  }
+  out += "true";
+  std::string screen, status, msgTitle, msgBody, msgCode, msgAction, msgHint;
+  luaGlobalString(L, "screen", screen);
+  luaGlobalString(L, "status_line", status);
+  luaGlobalString(L, "message_title", msgTitle);
+  luaGlobalString(L, "message_body", msgBody);
+  luaGlobalString(L, "message_code", msgCode);
+  luaGlobalString(L, "message_action", msgAction);
+  luaGlobalString(L, "message_hint", msgHint);
+  auto appendField = [&](const char* k, const std::string& v) {
+    out += ",\"";
+    out += k;
+    out += "\":\"";
+    jsonEscapeAppend(out, v.c_str());
+    out += "\"";
+  };
+  appendField("screen", screen);
+  appendField("status_line", status);
+  appendField("message_title", msgTitle);
+  appendField("message_body", msgBody);
+  appendField("message_code", msgCode);
+  appendField("message_action", msgAction);
+  appendField("message_hint", msgHint);
+  // Host-owned list scene (ui.listOpen) — titles of current page.
+  const auto& sc = uiScene_;
+  out += ",\"list_active\":";
+  out += sc.active ? "true" : "false";
+  if (sc.active) {
+    appendField("list_title", sc.title);
+    out += ",\"list_page\":";
+    out += std::to_string(sc.page);
+    out += ",\"list_page_size\":";
+    out += std::to_string(sc.pageSize);
+    out += ",\"list_rows\":[";
+    const size_t n = sc.rows.size();
+    const size_t maxShow = n > 12 ? 12 : n;
+    for (size_t i = 0; i < maxShow; ++i) {
+      if (i) out += ',';
+      out += '"';
+      jsonEscapeAppend(out, sc.rows[i].c_str());
+      out += '"';
+    }
+    out += "],\"list_row_count\":";
+    out += std::to_string(n);
+  }
+  out += '}';
+  return out;
 }
 
 void M4xLuaHost::stop() {

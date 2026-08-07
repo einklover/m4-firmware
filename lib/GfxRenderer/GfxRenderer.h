@@ -40,6 +40,7 @@ class GfxRenderer {
   bool fadingFix;
   uint8_t* frameBuffer = nullptr;
   uint8_t* bwBufferChunks[BW_BUFFER_NUM_CHUNKS] = {nullptr};
+  uint8_t* lastShownFrame = nullptr;  // persistent prev-page copy (PSRAM)
   uint8_t* rollingHalfBuffer = nullptr;  // for rolling auto-turn half-page blending
   std::map<int, EpdFontFamily> fontMap;
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, const int* y, bool pixelState,
@@ -176,6 +177,12 @@ class GfxRenderer {
   const uint8_t* bwBufferChunk(size_t i) const {
     return (i < BW_BUFFER_NUM_CHUNKS) ? bwBufferChunks[i] : nullptr;
   }
+  // Persistent "last displayed frame" for page-turn animation.  Unlike the
+  // AA scratch chunks (stored then freed by restoreBwBuffer), this copy
+  // survives until the next display, so the animation can read the previous
+  // page even after the new page has been rendered into frameBuffer.
+  bool storeLastShown();
+  const uint8_t* getLastShown() const { return lastShownFrame; }
   static size_t getBufferSize();
     //透明壁纸
   void drawPngFromTxtpng(const char* txtpng_file_path) const ;

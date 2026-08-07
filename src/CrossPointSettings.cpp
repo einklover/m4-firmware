@@ -100,7 +100,9 @@ bool CrossPointSettings::saveToFile() const {
   doc["sleepBeforeFullRefresh"]    = sleepBeforeFullRefresh;
   // Page-turn animation
   doc["pageTurnAnimationEnabled"]    = pageTurnAnimationEnabled;
+  doc["pageTurnAnimationPartial"]    = pageTurnAnimationPartial;
   doc["pageTurnAnimationSteps"]      = pageTurnAnimationSteps;
+  doc["pageTurnAnimationMult"]       = pageTurnAnimationMult;
   doc["pageTurnAnimationTp"]         = pageTurnAnimationTp;
   doc["pageTurnAnimationFrameRate"]  = pageTurnAnimationFrameRate;
   doc["pageTurnAnimationTailMs"]     = pageTurnAnimationTailMs;
@@ -733,13 +735,29 @@ bool CrossPointSettings::loadFromFile() {
           getString("transparentOverlayPxc", transparentOverlayPxc, sizeof(transparentOverlayPxc));
           sleepPngInvert           = doc["sleepPngInvert"]           | (uint8_t)1;
           sleepBeforeFullRefresh   = doc["sleepBeforeFullRefresh"]   | (uint8_t)1;
-          // Page-turn animation
+          // Page-turn animation (sanitize: FrameRate is a raw LUT byte, Dir is 0..3 index)
           pageTurnAnimationEnabled   = doc["pageTurnAnimationEnabled"]   | (uint8_t)0;
+          if (pageTurnAnimationEnabled > 1) pageTurnAnimationEnabled = 0;
+          pageTurnAnimationPartial   = doc["pageTurnAnimationPartial"]   | (uint8_t)0;
+          if (pageTurnAnimationPartial > 1) pageTurnAnimationPartial = 0;
           pageTurnAnimationSteps     = doc["pageTurnAnimationSteps"]     | (uint8_t)9;
+          if (pageTurnAnimationSteps < 2) pageTurnAnimationSteps = 2;
+          if (pageTurnAnimationSteps > 64) pageTurnAnimationSteps = 64;
+          pageTurnAnimationMult      = doc["pageTurnAnimationMult"]      | (uint8_t)4;
+          if (pageTurnAnimationMult < 1) pageTurnAnimationMult = 1;
+          if (pageTurnAnimationMult > 16) pageTurnAnimationMult = 16;
           pageTurnAnimationTp        = doc["pageTurnAnimationTp"]        | (uint8_t)0x02;
+          if (pageTurnAnimationTp < 1) pageTurnAnimationTp = 1;
+          if (pageTurnAnimationTp > 16) pageTurnAnimationTp = 16;
           pageTurnAnimationFrameRate = doc["pageTurnAnimationFrameRate"] | (uint8_t)0x88;
+          if (pageTurnAnimationFrameRate != 0x22 && pageTurnAnimationFrameRate != 0x44 &&
+              pageTurnAnimationFrameRate != 0x88) {
+            pageTurnAnimationFrameRate = 0x88;
+          }
           pageTurnAnimationTailMs    = doc["pageTurnAnimationTailMs"]    | (uint8_t)10;
+          if (pageTurnAnimationTailMs > 50) pageTurnAnimationTailMs = 50;
           pageTurnAnimationDir       = doc["pageTurnAnimationDir"]       | (uint8_t)0;
+          if (pageTurnAnimationDir > 3) pageTurnAnimationDir = 0;
           // Power & system
           shortPwrBtn              = doc["shortPwrBtn"]              | (uint8_t)PAGE_TURN;
           sleepTimeout             = doc["sleepTimeout"]             | (uint8_t)SLEEP_10_MIN;

@@ -824,6 +824,20 @@ void setup() {
         st.orientation = static_cast<int>(renderer.getOrientation());
         return st;
       };
+      // Text-level UI dump for automated debug (prefer over OCR/screenshot).
+      hooks.uiDump = []() -> std::string {
+        if (!currentActivity) {
+          return "{\"kind\":\"none\"}";
+        }
+        std::string body = currentActivity->debugUiJson();
+        if (body.empty()) body = "{}";
+        std::string out = "{\"activity_name\":\"";
+        out += currentActivity->getName();
+        out += "\",\"body\":";
+        out += body;
+        out += '}';
+        return out;
+      };
       hooks.goHome = []() { onGoHome(); };
       hooks.openFileTransferUi = []() { onGoToFileTransferUsb(); };
       hooks.noteActiveApp = [](const std::string& id) { gDebugActiveAppId = id; };

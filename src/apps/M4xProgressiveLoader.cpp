@@ -589,14 +589,18 @@ size_t Session::readDecoded(uint8_t* out, size_t want, bool* more, const char** 
 void Session::maybeEarlyChapter() {
   if (early_ || kind_ != Kind::Chapter) return;
   const size_t n = sink_ ? sink_->written() : bytes_;
-  if (n < earlyThreshold_ && phase_ != Phase::Done) return;
+  // earlyBytes == 0 means "open only when stream is complete" (fanqie sets
+  // this so partial pagination never freezes at ~few pages).  size_t n < 0 is
+  // never true, so without this guard early_bytes=0 would fire at 1 byte.
+  if (earlyThreshold_ == 0 && !streamComplete_ && phase_ != Phase::Done) return;
+  if (n < earlyThreshold_ && !streamComplete_ && phase_ != Phase::Done) return;
   if (n < 1) return;
   if (sink_) sink_->forceFlush();
   chapter_.open.relPath = relOut_;
   chapter_.open.absPath = absOut_;
-  // Early open: body still streaming. Mark pendingComplete so the native
-  // reader shows a loading placeholder instead of paginating the partial
-  // file; a final open (pendingComplete=false) follows in finishOk.
+  // Mid-stream early open: pendingComplete so the native reader shows a
+  // loading placeholder; finishOk re-opens with pendingComplete=false.
+  // Complete-stream open (finishOk path): open real reader immediately.
   chapter_.open.pendingComplete = !streamComplete_;
   if (!M4PluginReaderSession::queueOpen(chapter_.open)) {
     // Keep streaming; plugin may retry open.
@@ -605,7 +609,8 @@ void Session::maybeEarlyChapter() {
   early_ = true;
   if (phase_ == Phase::Streaming) phase_ = Phase::EarlyOpened;
 #if defined(ARDUINO_ARCH_ESP32)
-  Serial.printf("[LOADER] early_chapter bytes=%u path=%s\n", static_cast<unsigned>(n), relOut_.c_str());
+  Serial.printf("[LOADER] early_chapter bytes=%u pending=%d path=%s\n", static_cast<unsigned>(n),
+                chapter_.open.pendingComplete ? 1 : 0, relOut_.c_str());
 #endif
 }
 
@@ -661,8 +666,14 @@ void Session::finishOk() {
   if (kind_ == Kind::Toc && records_) rows_ = records_->recordCount();
   // Final catalog size → live TOC picker grows to full list.
   if (kind_ == Kind::Toc) publishTocRows(rows_);
-  // Ensure handoff if early never fired (tiny chapter / short toc).
+  // Body is complete before any open decision.  Must set this *before*
+  // maybeEarlyChapter / final re-open: pendingComplete = !streamComplete_,
+  // and the early→final branch used to check streamComplete_ while it was
+  // still false, so every progressive chapter stuck on the "加载中…"
+  // placeholder forever (both fanqie and jjwxc).
+  streamComplete_ = true;
   if (!early_) {
+    // Tiny chapter / short toc: first (and only) open with complete body.
     if (kind_ == Kind::Chapter) {
       earlyThreshold_ = 0;
       maybeEarlyChapter();
@@ -670,9 +681,9 @@ void Session::finishOk() {
       earlyThreshold_ = 0;
       maybeEarlyToc();
     }
-  } else if (kind_ == Kind::Chapter && streamComplete_) {
-    // Early open showed a loading placeholder; body is now complete.
-    // Re-open without pendingComplete so the reader paginates the full file.
+  } else if (kind_ == Kind::Chapter) {
+    // Early open showed a loading placeholder (pendingComplete=true).
+    // Re-open so the reader paginates the full file.
     chapter_.open.relPath = relOut_;
     chapter_.open.absPath = absOut_;
     chapter_.open.pendingComplete = false;
@@ -682,7 +693,6 @@ void Session::finishOk() {
 #endif
     }
   }
-  streamComplete_ = true;
   writeOkMarker();  // only fully finished bodies are cache-eligible
   phase_ = Phase::Done;
   scalar_.reset();

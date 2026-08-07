@@ -83,6 +83,10 @@ class M4xLuaHost {
   bool callProviderPump(std::string& errorOut);
   bool loaderNeedsPump() const;
 
+  // Read plugin globals + host list scene into a JSON object (no outer array).
+  // Safe when L_ is null (returns {"lua":false}). Owner-task only.
+  std::string debugUiJson() const;
+
   // Accessed by Lua C bindings in M4xLuaHost.cpp
   GfxRenderer* renderer_ = nullptr;
   M4xInstalledApp app_{};

@@ -66,17 +66,20 @@ uint32_t runAnimate(const char* prevPath, const char* nextPath, int steps, int f
 // same multipass wipe as runAnimate but without SD access.  Returns ms.
 uint32_t runAnimateMem(const uint8_t* oldFrame, const uint8_t* newFrame, int steps, int feather,
                        uint32_t tailMs, int dir);
-// Window multipass: each step refreshes the entire covered region [edge, W]
-// with RED=page1 / BW=page2 (re-drives already-wiped strips). Less early-step
-// SPI than full-frame. Returns total ms or 0.
-uint32_t runAnimateWindow(const char* prevPath, const char* nextPath, int steps);
-// Async animation session: start once, then pump one step per call from the
-// main loop (never block the loop for the whole animation — blocking starves
-// the watchdog).  pump returns false when the session is finished/failed.
-bool startAnimateWindow(const char* prevPath, const char* nextPath, int steps);
-// Generic async animation start (mode chosen by windowMode: false = full-frame
-// synthesis, true = window strips).
-bool startAnimate(const char* prevPath, const char* nextPath, int steps, int feather, bool windowMode);
+// Sliding-window partial wipe (SD frames): steps advances = steps refreshes,
+// then walk-off drain until the mult-wide trailing edge clears the panel
+// (~winMult more activates; no off-panel geometry). winMult = window width
+// in step units. dir: 0=R→L 1=L→R 2=B→T 3=T→B.
+uint32_t runAnimateWindow(const char* prevPath, const char* nextPath, int steps, uint32_t tailMs,
+                          int winMult, int dir = 0);
+// In-memory sliding-window partial wipe (reader page-turn path). Same enter +
+// walk-off semantics; tailMs ignored (settle is the walk-off, not full-frame).
+uint32_t runAnimateMemWindow(const uint8_t* oldFrame, const uint8_t* newFrame, int steps,
+                             int winMult, uint32_t tailMs, int dir = 0);
+bool startAnimateWindow(const char* prevPath, const char* nextPath, int steps, int winMult,
+                        int dir = 0);
+bool startAnimate(const char* prevPath, const char* nextPath, int steps, int feather, bool windowMode,
+                  int winMult = 1, int dir = 0);
 bool pumpAnimateWindow(uint32_t& stepMsOut);
 bool animateActive();
 // Post-animation settle: full-frame RED=oldPage, BW=newPage with the current

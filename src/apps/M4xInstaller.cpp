@@ -133,6 +133,68 @@ bool readEntryCapped(const std::string& packagePath, const char* entry, size_t m
   return true;
 }
 
+// Stream a STORED (or small) zip entry straight to SD — avoids malloc(whole entry)
+// which OOM'd jjwxc main.lua / gbk_table under low free heap during install.
+class SdWritePrint final : public Print {
+ public:
+  explicit SdWritePrint(FsFile& f) : f_(f) {}
+  size_t write(uint8_t c) override {
+    const int n = f_.write(&c, 1);
+    return n > 0 ? 1 : 0;
+  }
+  size_t write(const uint8_t* buf, size_t size) override {
+    size_t off = 0;
+    while (off < size) {
+      const size_t chunk = std::min<size_t>(4096, size - off);
+      const int n = f_.write(buf + off, chunk);
+      if (n <= 0) return off;
+      off += static_cast<size_t>(n);
+      esp_task_wdt_reset();
+    }
+    return off;
+  }
+
+ private:
+  FsFile& f_;
+};
+
+bool extractEntryToFile(const std::string& packagePath, const char* entry, size_t maxBytes,
+                        const std::string& outPath, std::string& err) {
+  ZipFile zip(packagePath);
+  size_t inflated = 0;
+  if (zip.getInflatedFileSize(entry, &inflated)) {
+    if (inflated > maxBytes) {
+      err = std::string("entry_too_large:") + entry;
+      return false;
+    }
+  }
+  // Prefer streaming for any entry that would stress the heap.
+  if (inflated == 0 || inflated > 24 * 1024) {
+    if (SdMan.exists(outPath.c_str())) SdMan.remove(outPath.c_str());
+    FsFile out;
+    if (!SdMan.openFileForWrite("M4x", outPath.c_str(), out)) {
+      err = std::string("write_failed:") + entry;
+      return false;
+    }
+    SdWritePrint sink(out);
+    const bool ok = zip.readFileToStream(entry, sink, 4096);
+    out.close();
+    if (!ok) {
+      SdMan.remove(outPath.c_str());
+      err = std::string("missing:") + entry;
+      return false;
+    }
+    return true;
+  }
+  std::vector<uint8_t> bytes;
+  if (!readEntryCapped(packagePath, entry, maxBytes, bytes, err)) return false;
+  if (!writeFileBytes(outPath.c_str(), bytes.data(), bytes.size())) {
+    err = std::string("write_failed:") + entry;
+    return false;
+  }
+  return true;
+}
+
 bool extractListed(const std::string& packagePath, const std::string& destRoot, const M4xManifest& m,
                    M4xInstallResult& r) {
   const auto plan = M4xPathSafe::makeExtractList(m.entry, m.icon, m.files);
@@ -155,11 +217,41 @@ bool extractListed(const std::string& packagePath, const std::string& destRoot, 
     }
 
     const size_t cap = M4xPathSafe::maxBytesForEntry(rel, m.entry);
-    std::vector<uint8_t> bytes;
+    size_t entryBytes = 0;
+    {
+      ZipFile zipProbe(packagePath);
+      if (!zipProbe.getInflatedFileSize(rel.c_str(), &entryBytes)) {
+        if (!m.icon.empty() && rel == m.icon) {
+          Serial.printf("[M4x] optional icon missing: %s\n", rel.c_str());
+          continue;
+        }
+        r.error = std::string("missing:") + rel;
+        r.message = std::string("解压失败: missing:") + rel;
+        return false;
+      }
+    }
+    if (entryBytes == 0 && rel == m.entry) {
+      r.error = "empty_entry";
+      r.message = "入口脚本为空";
+      return false;
+    }
+    if (entryBytes > cap) {
+      r.error = std::string("entry_too_large:") + rel;
+      r.message = std::string("解压失败: entry_too_large:") + rel;
+      return false;
+    }
+    if (total + entryBytes > M4xPathSafe::kMaxTotalExtractBytes) {
+      r.error = "package_too_large";
+      r.message = "安装包解压总量超限";
+      return false;
+    }
+
+    std::string outPath = destRoot;
+    if (!outPath.empty() && outPath.back() != '/') outPath += '/';
+    outPath += rel;
+    ensureParentDirs(outPath, destRoot.size());
     std::string err;
-    if (!readEntryCapped(packagePath, rel.c_str(), cap, bytes, err)) {
-      // Icon is optional only when declared but missing? Spec: listed files are required.
-      // Icon was historically optional — keep optional if read fails for icon only.
+    if (!extractEntryToFile(packagePath, rel.c_str(), cap, outPath, err)) {
       if (!m.icon.empty() && rel == m.icon) {
         Serial.printf("[M4x] optional icon missing: %s\n", rel.c_str());
         continue;
@@ -168,28 +260,8 @@ bool extractListed(const std::string& packagePath, const std::string& destRoot, 
       r.message = std::string("解压失败: ") + err;
       return false;
     }
-    if (bytes.empty() && rel == m.entry) {
-      r.error = "empty_entry";
-      r.message = "入口脚本为空";
-      return false;
-    }
-    if (total + bytes.size() > M4xPathSafe::kMaxTotalExtractBytes) {
-      r.error = "package_too_large";
-      r.message = "安装包解压总量超限";
-      return false;
-    }
-    total += bytes.size();
-
-    std::string outPath = destRoot;
-    if (!outPath.empty() && outPath.back() != '/') outPath += '/';
-    outPath += rel;
-    ensureParentDirs(outPath, destRoot.size());
-    if (!writeFileBytes(outPath.c_str(), bytes.data(), bytes.size())) {
-      r.error = std::string("write_failed:") + rel;
-      r.message = std::string("写入失败: ") + rel;
-      return false;
-    }
-    Serial.printf("[M4x] extracted %s (%u bytes)\n", rel.c_str(), static_cast<unsigned>(bytes.size()));
+    total += entryBytes;
+    Serial.printf("[M4x] extracted %s (%u bytes)\n", rel.c_str(), static_cast<unsigned>(entryBytes));
     esp_task_wdt_reset();
   }
   return true;
