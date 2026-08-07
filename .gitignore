@@ -15,3 +15,12 @@ build/m4adb/
 *.session.json
 **/session.json
 simulator/build*/
+
+# Absolute-path symlinks into the source SDK tree (dangling on clone; never commit)
+lib/Epub
+lib/Lua
+lib/expat
+lib/miniz
+lib/picojpeg
+lib/EpdFont/builtinFonts
+open-m4-sdk

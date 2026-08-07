@@ -37,6 +37,10 @@
 #include <EpdFontLoader.h>
 #include <mbedtls/sha256.h>
 
+// Full types for the reused keep-alive connection members (netTls_/netHttp_).
+#include <HTTPClient.h>
+#include <NetworkClientSecure.h>
+
 // Lua must see clean macros; Arduino min/max break luaconf under C++.
 #include "lua_arduino_compat.h"
 extern "C" {
@@ -2061,8 +2065,12 @@ int l_net_request(lua_State* L) {
   const size_t largestInternal =
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (largestInternal < 40 * 1024) {
-    Serial.printf("[M4xNet] TLS skipped: internal largest=%u\n",
-                  static_cast<unsigned>(largestInternal));
+    Serial.printf("[M4xNet] TLS skipped: internal largest=%u free=%u psram=%u lua=%u/%u\n",
+                  static_cast<unsigned>(largestInternal),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  h ? static_cast<unsigned>(h->luaMemUsed()) : 0u,
+                  h ? static_cast<unsigned>(h->luaMemLimit()) : 0u);
     return fail("oom");
   }
 
@@ -2388,8 +2396,12 @@ int l_net_extractPsvts(lua_State* L) {
   const size_t largestInternal =
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (largestInternal < 40 * 1024) {
-    Serial.printf("[M4xNet] TLS skipped (extractPsvts): internal largest=%u\n",
-                  static_cast<unsigned>(largestInternal));
+    Serial.printf("[M4xNet] TLS skipped (extractPsvts): internal largest=%u free=%u psram=%u lua=%u/%u\n",
+                  static_cast<unsigned>(largestInternal),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  h ? static_cast<unsigned>(h->luaMemUsed()) : 0u,
+                  h ? static_cast<unsigned>(h->luaMemLimit()) : 0u);
     return fail("oom");
   }
 
@@ -3348,9 +3360,11 @@ class TransactionJsonSink final : public M4xJsonStream::Sink {
 
 class NetworkBodySource final : public M4xHostIo::StreamSource {
  public:
-  explicit NetworkBodySource(NetworkClient* stream) : stream_(stream) {}
+  explicit NetworkBodySource(NetworkClient* stream, bool chunked = false)
+      : stream_(stream), chunked_(chunked) {}
   int read(uint8_t* data, size_t capacity) override {
     if (!stream_) return -2;
+    if (chunked_) return readChunked(data, capacity);
     const int avail = stream_->available();
     if (avail > 0) {
       const size_t want = std::min<size_t>(capacity, static_cast<size_t>(avail));
@@ -3359,8 +3373,68 @@ class NetworkBodySource final : public M4xHostIo::StreamSource {
     }
     return stream_->connected() ? 0 : -1;
   }
+
  private:
+  // http.getStreamPtr() returns the RAW TCP stream — chunked responses keep
+  // their `1a2b\r\n...\r\n` framing. jjwxc app-cdn sends chunked+keep-alive;
+  // feeding the framing to ArduinoJson yielded InvalidInput on every
+  // category fetch (head=0x35 tail=0x0a). Decode chunk framing here and
+  // report a true -1 EOF at the 0-length chunk (no idle-timeout guessing).
+  int readChunked(uint8_t* data, size_t capacity) {
+    if (done_) return -1;
+    for (;;) {
+      if (trailerRemain_ > 0) {
+        while (trailerRemain_ > 0) {
+          const int c = stream_->read();
+          if (c < 0) return 0;  // WANT_READ: wait for more
+          --trailerRemain_;
+        }
+        continue;
+      }
+      if (chunkRemain_ > 0) {
+        const size_t want = std::min(capacity, chunkRemain_);
+        const int n = stream_->read(data, static_cast<int>(want));
+        if (n < 0) return 0;  // TLS WANT_READ
+        if (n == 0) return 0;
+        chunkRemain_ -= static_cast<size_t>(n);
+        if (chunkRemain_ == 0) trailerRemain_ = 2;  // \r\n after chunk data
+        return n;
+      }
+      // Read a chunk-size line.
+      int c = stream_->read();
+      if (c < 0) return 0;
+      if (c == '\n') {
+        size_t hn = hlen_;
+        while (hn && (header_[hn - 1] == '\r' || header_[hn - 1] == ' ')) --hn;
+        hlen_ = 0;
+        size_t size = 0;
+        for (size_t i = 0; i < hn; ++i) {
+          const char ch = static_cast<char>(header_[i]);
+          unsigned v;
+          if (ch >= '0' && ch <= '9') v = static_cast<unsigned>(ch - '0');
+          else if (ch >= 'a' && ch <= 'f') v = static_cast<unsigned>(ch - 'a' + 10);
+          else if (ch >= 'A' && ch <= 'F') v = static_cast<unsigned>(ch - 'A' + 10);
+          else return -2;
+          size = size * 16 + v;
+        }
+        if (size == 0) {
+          done_ = true;
+          return -1;  // last chunk: clean EOF
+        }
+        chunkRemain_ = size;
+        continue;
+      }
+      if (hlen_ < sizeof(header_) - 1) header_[hlen_++] = static_cast<uint8_t>(c);
+    }
+  }
+
   NetworkClient* stream_;
+  bool chunked_ = false;
+  bool done_ = false;
+  size_t chunkRemain_ = 0;
+  size_t trailerRemain_ = 0;
+  uint8_t header_[40];
+  size_t hlen_ = 0;
 };
 
 class HashTransactionSink final : public M4xHostIo::StreamSink {
@@ -3449,7 +3523,9 @@ bool dlStreamToFile(const std::string& url, const std::vector<std::pair<std::str
   mbedtls_sha256_context ctx;
   mbedtls_sha256_init(&ctx);
   mbedtls_sha256_starts(&ctx, 0);
-  NetworkBodySource source(http.getStreamPtr());
+  const String teHeader = http.header("Transfer-Encoding");
+  const bool chunked = teHeader.length() > 0 && teHeader.indexOf("chunked") >= 0;
+  NetworkBodySource source(http.getStreamPtr(), chunked);
   HashTransactionSink sink(writer, ctx);
   const size_t expected = cl >= 0 ? static_cast<size_t>(cl) : static_cast<size_t>(-1);
   const M4xHostIo::StreamResult transferred =
@@ -3613,102 +3689,128 @@ int l_dl_jsonGet(lua_State* L) {
                               netMaxBodyBytes());
   const uint32_t safeTimeout = M4xHostIo::Limits::timeoutMs(timeoutMs);
 
-  // Reclaim Lua + refuse TLS when internal heap is fragmented (same gate as
-  // net.request). Category booklist OOM used to surface as generic http fail.
-  lua_gc(L, LUA_GCCOLLECT, 0);
-  {
-    const size_t largestInternal =
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (largestInternal < 40 * 1024) {
-      Serial.printf("[M4xNet] dl.jsonGet TLS skipped: internal largest=%u\n",
-                    static_cast<unsigned>(largestInternal));
+  // Stream response into a PSRAM-backed buffer. Reuse one keep-alive TLS
+  // connection (netTls_/netHttp_): a fresh handshake per request fragments
+  // internal RAM with mbedTLS session buffers (the "list too large; back to
+  // shelf" OOM), so the 40KB gate below only runs when a new handshake is
+  // actually needed. HTTPClient disconnects itself on host change; a dead
+  // keep-alive (server/NAT close) is rebuilt once via the retry loop.
+  bool insecureRetried = false;
+  int attempt = 0;
+  int code = -1;
+  for (;;) {
+    ++attempt;
+    const bool needHandshake = !h->netHttp_ || !h->netTls_ || !h->netTls_->connected();
+    if (needHandshake) {
+      // Reclaim Lua + refuse TLS when internal heap is fragmented (same gate
+      // as net.request). Category booklist OOM used to surface as generic
+      // http fail. A live keep-alive connection skips this: its mbedTLS
+      // buffers already exist and no new contiguous block is required.
+      lua_gc(L, LUA_GCCOLLECT, 0);
+      const size_t largestInternal =
+          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      if (largestInternal < 40 * 1024) {
+        Serial.printf("[M4xNet] dl.jsonGet TLS skipped: internal largest=%u free=%u psram=%u lua=%u/%u\n",
+                      static_cast<unsigned>(largestInternal),
+                      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                      h ? static_cast<unsigned>(h->luaMemUsed()) : 0u,
+                      h ? static_cast<unsigned>(h->luaMemLimit()) : 0u);
+        lua_pushnil(L);
+        lua_pushstring(L, "oom");
+        return 2;
+      }
+      if (h->netTls_) h->netTls_->stop();
+      h->netTls_.reset();
+      h->netHttp_.reset();
+    }
+    if (!h->netHttp_ || !h->netTls_) {
+      h->netTls_ = std::make_unique<WiFiClientSecure>();
+      h->netHttp_ = std::make_unique<HTTPClient>();
+    }
+    auto* secure = h->netTls_.get();
+    if (insecureRetried) secure->setInsecure();
+    configureTlsClient(secure, h);
+    HTTPClient& http = *h->netHttp_;
+    http.setTimeout(static_cast<int>(safeTimeout));
+    http.setFollowRedirects(followRedirects ? HTTPC_FORCE_FOLLOW_REDIRECTS
+                                            : HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.collectAllHeaders(true);
+    if (!http.begin(*secure, url)) {
+      // Same-domain mirror fallback: retry once without cert verification when
+      // the chain is valid but absent from the device bundle.  Only applies to
+      // explicit follow_redirects requests (public mirrors, no credentials).
+      if (followRedirects && !insecureRetried && M4xHttp::sameOrigin(urlIn, url)) {
+        insecureRetried = true;
+        continue;
+      }
+      if (attempt == 1) continue;  // reused connection died: rebuild once
       lua_pushnil(L);
-      lua_pushstring(L, "oom");
+      lua_pushstring(L, "http_begin_failed");
       return 2;
     }
-  }
-
-  // Stream response into a PSRAM-backed buffer.
-  bool insecureRetried = false;
-retry_tls_json_get:
-  auto* secure = new WiFiClientSecure();
-  if (insecureRetried) secure->setInsecure();
-  configureTlsClient(secure, h);
-  std::unique_ptr<WiFiClient> client(secure);
-  HTTPClient http;
-  http.setTimeout(static_cast<int>(safeTimeout));
-  http.setFollowRedirects(followRedirects ? HTTPC_FORCE_FOLLOW_REDIRECTS
-                                          : HTTPC_DISABLE_FOLLOW_REDIRECTS);
-  http.collectAllHeaders(true);
-  if (!http.begin(*client, url)) {
-    // Same-domain mirror fallback: retry once without cert verification when
-    // the chain is valid but absent from the device bundle.  Only applies to
-    // explicit follow_redirects requests (public mirrors, no credentials).
-    if (followRedirects && !insecureRetried && M4xHttp::sameOrigin(urlIn, url)) {
-      insecureRetried = true;
-      goto retry_tls_json_get;
-    }
-    lua_pushnil(L);
-    lua_pushstring(L, "http_begin_failed");
-    return 2;
-  }
-  // Extend wall *before* TLS/GET — long category fetches used to sit silent
-  // until timeout with dual-UA hangs (jjwxc app-cdn).
-  if (h) h->extendCallbackWallMs(safeTimeout + 12000);
-  Serial.printf("[M4xNet] dl.jsonGet begin %s\n", url);
-  applyHttpHeaders(http, headers, "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xApp/1.0");
-  const int code = http.GET();
-  if (code < 0) {
+    // Extend wall *before* TLS/GET — long category fetches used to sit silent
+    // until timeout with dual-UA hangs (jjwxc app-cdn).
+    if (h) h->extendCallbackWallMs(safeTimeout + 12000);
+    Serial.printf("[M4xNet] dl.jsonGet begin %s\n", url);
+    applyHttpHeaders(http, headers, "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 M4xApp/1.0");
+    code = http.GET();
+    if (code >= 0) break;
     http.end();
     if (followRedirects && !insecureRetried && M4xHttp::sameOrigin(urlIn, url)) {
       insecureRetried = true;
-      goto retry_tls_json_get;
+      continue;
     }
+    if (attempt == 1) continue;  // stale keep-alive: one rebuild
     Serial.printf("[M4xNet] dl.jsonGet GET fail code=%d\n", code);
     lua_pushnil(L);
     lua_pushstring(L, "http_request_failed");
     return 2;
   }
   if (code >= 300 && code < 400) {
-    http.end();
+    h->netHttp_->end();
     lua_pushnil(L);
     lua_pushstring(L, "redirect_unsupported");
     return 2;
   }
   if (code != HTTP_CODE_OK) {
-    http.end();
+    h->netHttp_->end();
     lua_pushnil(L);
     lua_pushstring(L, ("http_" + std::to_string(code)).c_str());
     return 2;
   }
-  const int cl = http.getSize();
+  const int cl = h->netHttp_->getSize();
   if (cl > 0 && static_cast<size_t>(cl) > cap) {
-    http.end();
+    h->netHttp_->end();
     lua_pushnil(L);
     lua_pushstring(L, "response_too_large");
     return 2;
   }
   Serial.printf("[M4xNet] dl.jsonGet GET ok status=%d cl=%d\n", code, cl);
+  const String teHeader = h->netHttp_->header("Transfer-Encoding");
+  const bool chunked = teHeader.length() > 0 && teHeader.indexOf("chunked") >= 0;
   NetBodyBuf body;
   const size_t initial = cl > 0 ? static_cast<size_t>(cl) : std::min<size_t>(cap, 16 * 1024);
   if (initial && !body.reserve(initial)) {
-    http.end();
+    h->netHttp_->end();
     lua_pushnil(L);
     lua_pushstring(L, "out_of_memory");
     return 2;
   }
-  NetworkBodySource source(http.getStreamPtr());
+  NetworkBodySource source(h->netHttp_->getStreamPtr(), chunked);
   NetBodyStreamSink sink(body, cap);
   const size_t expected = cl >= 0 ? static_cast<size_t>(cl) : static_cast<size_t>(-1);
   const M4xHostIo::StreamResult transferred =
       M4xHostIo::stream(source, sink, cap, expected, safeTimeout, hostStreamRuntime());
-  http.end();
+  h->netHttp_->end();
   if (!transferred.ok()) {
     const char* err = transferred.error == M4xHostIo::StreamError::Sink
                           ? "response_too_large_or_oom"
                           : M4xHostIo::streamErrorString(transferred.error);
     Serial.printf("[M4xNet] dl.jsonGet body fail err=%s bytes=%u\n", err,
                   static_cast<unsigned>(body.len));
+    // A timed-out/truncated body usually leaves the connection unusable.
+    if (h->netTls_) h->netTls_->stop();
     lua_pushnil(L);
     lua_pushstring(L, err);
     return 2;
@@ -3780,6 +3882,25 @@ retry_tls_json_get:
         body.len > 0 ? static_cast<unsigned char>(body.data[body.len - 1]) : 0;
     Serial.printf("[M4xNet] dl.jsonGet parse fail: %s head=0x%02x tail=0x%02x len=%u\n",
                   derr.c_str(), head, tail, static_cast<unsigned>(body.len));
+    // Diagnosis: dump the raw body (bounded) so a device-side Wi-Fi stream
+    // truncation is visible from the host (serial log channel is unreliable).
+    if (h) {
+      std::string abs;
+      std::string rel = "debug_jsonget_fail.bin";
+      if (sandboxDataPath(h, rel.c_str(), abs)) {
+        FsFile df;
+        if (SdMan.openFileForWrite("M4xLua", abs.c_str(), df)) {
+          const size_t dumpN = std::min<size_t>(body.len, 4096);
+          if (dumpN) df.write(reinterpret_cast<const uint8_t*>(body.data), dumpN);
+          char meta[96];
+          const int mn = snprintf(meta, sizeof(meta),
+                                  "\n--derr=%s len=%u cl=%d\n", derr.c_str(),
+                                  static_cast<unsigned>(body.len), cl);
+          if (mn > 0) df.write(reinterpret_cast<const uint8_t*>(meta), static_cast<size_t>(mn));
+          df.close();
+        }
+      }
+    }
     lua_pushnil(L);
     lua_pushstring(L, "json_parse_failed");
     return 2;
@@ -4028,7 +4149,9 @@ int l_dl_jsonToFile(lua_State* L) {
   TransactionJsonSink sink(writer);
   M4xJsonStream::RecordExtractor extractor(path, fields, sink);
   JsonExtractorStreamSink streamSink(extractor);
-  NetworkBodySource source(http.getStreamPtr());
+  const String teHeader = http.header("Transfer-Encoding");
+  const bool chunked = teHeader.length() > 0 && teHeader.indexOf("chunked") >= 0;
+  NetworkBodySource source(http.getStreamPtr(), chunked);
   const size_t expected = cl >= 0 ? static_cast<size_t>(cl) : static_cast<size_t>(-1);
   const M4xHostIo::StreamResult transferred =
       M4xHostIo::stream(source, streamSink, cap, expected, safeTimeout, hostStreamRuntime());
@@ -4693,6 +4816,7 @@ bool M4xLuaHost::handleUiSceneTouch(int x, int y, const char* phase, std::string
 }
 
 
+M4xLuaHost::M4xLuaHost() = default;
 M4xLuaHost::~M4xLuaHost() { stop(); }
 
 bool M4xLuaHost::start(GfxRenderer& renderer, const M4xInstalledApp& app, std::string& errorOut) {

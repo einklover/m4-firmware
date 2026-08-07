@@ -226,8 +226,10 @@ inline StreamResult stream(StreamSource& source, StreamSink& sink, size_t cap,
   const uint32_t start = runtime.nowMs ? runtime.nowMs() : 0;
   uint32_t lastProgressMs = start;
   // Quiet window after last byte.  Too short → mid-transfer pause false EOF;
-  // too long → slow UI.  700ms covers CDN chunked keep-alive end.
-  constexpr uint32_t kIdleEofMs = 700;
+  // too long → slow UI.  CDN chunked keep-alive ends with quiet, but real
+  // Wi-Fi transfers stall >1s (retransmits) — 700ms truncated the 45KB
+  // jjwxc category JSON at 18KB (InvalidInput). 3s keeps correctness.
+  constexpr uint32_t kIdleEofMs = 3000;
   for (;;) {
     if (runtime.cancelled && runtime.cancelled()) {
       out.error = StreamError::Cancelled;
