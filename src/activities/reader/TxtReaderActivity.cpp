@@ -793,6 +793,10 @@ void TxtReaderActivity::pageTurnLocked(int delta) {
       indexComplete_ = false;
       firstPageReady_ = false;
       tidxSaved_ = false;
+      // New chapter = new content regardless of page number; force first physical
+      // drive (same-page skip would block it when the prev chapter's last page
+      // number collides, e.g. a single-page chapter).
+      lastPhysicalBodyPage_ = -1;
       updateRequired = true;
       Serial.printf("[%lu] [TRS] Switch to chapter %d (prev)\n", millis(), chapternum);
     } else if (delta > 0 && indexComplete_ && currentPage >= totalPages - 1) {
@@ -804,6 +808,9 @@ void TxtReaderActivity::pageTurnLocked(int delta) {
       indexComplete_ = false;
       firstPageReady_ = false;
       tidxSaved_ = false;
+      // Same guard as prev-chapter: force physical drive for the new chapter's
+      // first page (skip would collide when prev chapter had a single page).
+      lastPhysicalBodyPage_ = -1;
       updateRequired = true;
       Serial.printf("[%lu] [TRS] Switch to chapter %d (next), start from page 0\n", millis(), chapternum);
     }
@@ -1881,8 +1888,11 @@ void TxtReaderActivity::displayTaskLoop() {
           firstPageReady_ = true;
         } else if (chapter_initialized && !pageOffsets.empty() && !firstFrameHasLines) {
           // Retry next tick instead of flushing a blank buffer (looks like "page 1 empty").
+          // cachedPage was already set to currentPage → force a reload next tick, or
+          // the retry spins forever on the same empty lines (busy loop, page never shows).
           firstPageReady_ = false;
           pluginPendingHalfFlush_ = false;
+          cachedPage = -1;
           updateRequired = true;
         }
         doHalfFlush = pluginPendingHalfFlush_ && firstFrameHasLines;
