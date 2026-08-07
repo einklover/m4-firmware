@@ -652,8 +652,11 @@ int l_gui_drawQR(lua_State* L) {
   const char* data = luaL_checkstring(L, 3);
   const int px = lua_isnoneornil(L, 4) ? QRCodeHelper::DEFAULT_PX : static_cast<int>(luaL_checknumber(L, 4));
   if (px < 1 || px > 12 || !data) return 0;
-  QRCodeHelper::drawQRCode(*h->renderer_, x, y, std::string(data), static_cast<uint8_t>(px));
-  return 0;
+  // Draw with auto-version selection; push success flag so plugins can surface
+  // "QR too large" instead of showing a broken/undecodable code.
+  const bool ok = QRCodeHelper::drawQRCode(*h->renderer_, x, y, std::string(data), static_cast<uint8_t>(px));
+  lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
 }
 
 int l_gui_qrSize(lua_State* L) {
@@ -4818,6 +4821,16 @@ bool M4xLuaHost::handleUiSceneTouch(int x, int y, const char* phase, std::string
 
 M4xLuaHost::M4xLuaHost() = default;
 M4xLuaHost::~M4xLuaHost() { stop(); }
+
+void M4xLuaHost::releaseNetworkSession() {
+  // The keep-alive mbedTLS session retains ~32KB of internal RAM (in/out
+  // content buffers). Drop it before the native reader runs (no networking
+  // needed there) so the next chapter open keeps internal headroom.
+  if (netHttp_) netHttp_->end();
+  if (netTls_) netTls_->stop();
+  netHttp_.reset();
+  netTls_.reset();
+}
 
 bool M4xLuaHost::start(GfxRenderer& renderer, const M4xInstalledApp& app, std::string& errorOut) {
   stop();

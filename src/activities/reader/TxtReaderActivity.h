@@ -254,6 +254,13 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   // tap (panel idle) starts the animation immediately.
   bool quickMode_ = false;
   uint32_t lastPageTurnMs_ = 0;
+  // Physical frame snapshot: the page actually laid into the framebuffer and
+  // submitted to the EPD. Updated when render starts; consumed by
+  // finishPhysicalDisplay AFTER the animation settles. NEVER assign
+  // lastPhysicalBodyPage_ from the live currentPage — it keeps advancing
+  // during the animation and would falsely mark the target as already shown
+  // (lost click: catch-up never fires because currentPage==lastPhysicalBodyPage_).
+  int pendingPhysicalPage_ = -1;
   // Set on onExit / openMenu so display task stops starting new frames.
   std::atomic<bool> suppressDisplay_{false};
   void finishPhysicalDisplay();  // displayBuffer + optional AA (no state lock)

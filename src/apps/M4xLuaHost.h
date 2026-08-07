@@ -103,6 +103,10 @@ class M4xLuaHost {
   // next request (GET<0 path). Owner-task only.
   std::unique_ptr<NetworkClientSecure> netTls_;
   std::unique_ptr<HTTPClient> netHttp_;
+  // Drop the keep-alive TLS connection now (frees ~32KB internal RAM that the
+  // mbedTLS session retains). Called before entering the native reader, where
+  // no networking happens — keeps internal headroom for the next chapter.
+  void releaseNetworkSession();
 
   // True only when this host established Wi-Fi via net.connectSaved.
   // On stop, disconnect only if owned (never tear down another component's link).

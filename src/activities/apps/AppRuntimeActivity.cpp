@@ -482,6 +482,12 @@ void AppRuntimeActivity::tryLaunchPluginReader() {
     return;
   }
   const uint32_t handoffStartedMs = millis();
+  // Free the plugin's keep-alive TLS session before the native reader runs —
+  // ~32KB internal RAM that otherwise makes the next chapter open OOM. The
+  // reader itself does no networking; provider next-chapter prefetch builds a
+  // fresh handshake, which succeeds when internal RAM is calm (and retries
+  // otherwise).
+  host_.releaseNetworkSession();
   const uint32_t tLoad0 = millis();
   auto txt = std::make_unique<Txt>(req.absPath, "/.crosspoint");
   const bool loaded = txt->load();

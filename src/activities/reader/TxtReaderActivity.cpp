@@ -792,13 +792,16 @@ void TxtReaderActivity::pageTurnLocked(int delta) {
     // and the panel is idle (displayTaskLoop), straight to the target page.
     // There is NO debounce delay: a slow tap (panel idle) starts the animation
     // immediately on the next display-task tick.
+    // CRITICAL: never clear a queued refresh. updateRequired is execution
+    // state — a tap is an event and must not cancel a pending refresh, or a
+    // click gets lost (first tap builds page2, a second tap would be needed to
+    // "wake" the chase).
     const uint32_t nowMs = millis();
     const bool quickTap = (lastPageTurnMs_ != 0 && (nowMs - lastPageTurnMs_ < 400)) ||
                           physicalEpdBusy_.load();
     lastPageTurnMs_ = nowMs;
     if (quickTap) {
       quickMode_ = true;
-      updateRequired = false;
     } else {
       quickMode_ = false;
       updateRequired = true;
@@ -820,7 +823,7 @@ void TxtReaderActivity::pageTurnLocked(int delta) {
         (lastPageTurnMs_ != 0 && (burstMs - lastPageTurnMs_) < 400) || physicalEpdBusy_.load();
     if (quickBurst) {
       quickMode_ = true;
-      updateRequired = false;
+      // Keep any queued updateRequired — a tap must not cancel a pending refresh.
       unlockState();
       return;
     }
@@ -874,8 +877,7 @@ void TxtReaderActivity::pageTurnLocked(int delta) {
       // number collides, e.g. a single-page chapter).
       lastPhysicalBodyPage_ = -1;
       if (quickTap2) {
-        quickMode_ = true;
-        updateRequired = false;
+        quickMode_ = true;  // keep any queued updateRequired (no lost click)
       } else {
         quickMode_ = false;
         updateRequired = true;
@@ -896,8 +898,7 @@ void TxtReaderActivity::pageTurnLocked(int delta) {
       // first page (skip would collide when prev chapter had a single page).
       lastPhysicalBodyPage_ = -1;
       if (quickTap2) {
-        quickMode_ = true;
-        updateRequired = false;
+        quickMode_ = true;  // keep any queued updateRequired (no lost click)
       } else {
         quickMode_ = false;
         updateRequired = true;
@@ -1920,21 +1921,17 @@ void TxtReaderActivity::displayTaskLoop() {
       vTaskDelay(20 / portTICK_PERIOD_MS);
       continue;
     }
-    // Decoupled catch-up: once the panel is idle and a quick-skip target is
-    // pending (target page differs from the body on panel), render and refresh
-    // straight to it. No debounce — the target is whatever the latest taps
-    // accumulated, and the in-flight animation is waited out via
-    // physicalEpdBusy_. Cross-chapter advances also land here (re-init).
-    // If the target page's index is not ready yet, push the progressive index
-    // until it covers the target — never skip the tap (a later frame then
-    // renders + animates, so a click always produces a response, just with
-    // whatever index latency it needs).
-    if (quickMode_ && !physicalEpdBusy_.load() && !updateRequired && firstPhysicalShown_ &&
+    // Catch-up invariant (independent of quickMode_): whenever the panel is
+    // idle, no refresh is queued, and the TARGET page differs from the PHYSICAL
+    // page on the panel, we must drive it — target!=physical can never be left
+    // waiting for another tap. A slow tap sets updateRequired directly; if that
+    // render gets deferred (index not ready, EPD busy) this block is the safety
+    // net that keeps re-arming it until target == physical.
+    if (!physicalEpdBusy_.load() && !updateRequired && firstPhysicalShown_ &&
         (lastPhysicalBodyPage_ < 0 || currentPage != lastPhysicalBodyPage_)) {
       if (currentPage >= 0 && currentPage < static_cast<int>(pageOffsets.size())) {
-        quickMode_ = false;
         updateRequired = true;
-        Serial.printf("[%lu] [TRS] quick_catchup target=%d body=%d\n", millis(), currentPage,
+        Serial.printf("[%lu] [TRS] catchup target=%d body=%d\n", millis(), currentPage,
                       lastPhysicalBodyPage_);
       } else if (!indexComplete_) {
         // Target page not indexed yet: push the progressive index until it
@@ -1954,7 +1951,7 @@ void TxtReaderActivity::displayTaskLoop() {
           unlockState();
         }
       } else {
-        quickMode_ = false;  // index complete but target out of range — nothing to chase
+        // index complete but target out of range — nothing to chase
       }
     }
     if (updateRequired) {
@@ -2067,7 +2064,7 @@ void TxtReaderActivity::displayTaskLoop() {
         }
         // Seed PTA/old-page baseline (library path does this in finishPhysicalDisplay).
         firstPhysicalShown_ = true;
-        lastPhysicalBodyPage_ = currentPage;
+        lastPhysicalBodyPage_ = (pendingPhysicalPage_ >= 0) ? pendingPhysicalPage_ : currentPage;
         pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
         (void)renderer.storeBwBuffer();  // required for AA / legacy anim prev
         (void)renderer.storeLastShown();
@@ -3324,6 +3321,9 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, size_t endOffset, std::v
 
 void TxtReaderActivity::renderPage(bool skipDisplay, int xOffset, bool skipInvert) {
   const uint32_t tRender0 = millis();
+  // Snapshot the page being laid out — this is what the EPD will show after
+  // the physical drive, regardless of how far currentPage advances meanwhile.
+  pendingPhysicalPage_ = currentPage;
   int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
   renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
                                    &orientedMarginLeft);
@@ -3578,8 +3578,7 @@ void TxtReaderActivity::renderPage(bool skipDisplay, int xOffset, bool skipInver
     return;
   }
 
-  lastPhysicalBodyPage_ = currentPage;
-  logPerf("renderPage", millis() - tRender0, currentPage,
+  logPerf("renderPage", millis() - tRender0, pendingPhysicalPage_,
           static_cast<uint32_t>(pageOffsets.size()) |
               (indexComplete_ ? 0x80000000u : 0u));
   finishPhysicalDisplay();
@@ -3608,7 +3607,7 @@ void TxtReaderActivity::finishPhysicalDisplay() {
   const bool firstContent = !firstPhysicalShown_;
   if (firstContent) {
     firstPhysicalShown_ = true;
-    lastPhysicalBodyPage_ = currentPage;
+    lastPhysicalBodyPage_ = (pendingPhysicalPage_ >= 0) ? pendingPhysicalPage_ : currentPage;
     Serial.printf("[%lu] [PTA] first content frame (after white seed) anim=%d\n", millis(),
                   wantAnim ? 1 : 0);
   }
@@ -3695,9 +3694,11 @@ void TxtReaderActivity::finishPhysicalDisplay() {
       oldCopy = nullptr;
       if (played) {
         Serial.printf("[%lu] [PTA] anim done ms=%u\n", millis(), (unsigned)ms);
-        logPerf("anim", (uint32_t)ms, currentPage, 0);
+        logPerf("anim", (uint32_t)ms, pendingPhysicalPage_, 0);
         pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
-        lastPhysicalBodyPage_ = currentPage;
+        // Physical page = the frame we actually animated to (snapshot), never
+        // the live target — currentPage may have advanced during the wipe.
+        lastPhysicalBodyPage_ = (pendingPhysicalPage_ >= 0) ? pendingPhysicalPage_ : currentPage;
         (void)renderer.storeBwBuffer();
         (void)renderer.storeLastShown();
         // Decoupled catch-up: check immediately after the animation settles —
@@ -3751,7 +3752,7 @@ void TxtReaderActivity::finishPhysicalDisplay() {
   if (bwBufferStored) {
     renderer.restoreBwBuffer();
   }
-  lastPhysicalBodyPage_ = currentPage;
+  lastPhysicalBodyPage_ = (pendingPhysicalPage_ >= 0) ? pendingPhysicalPage_ : currentPage;
   (void)renderer.storeLastShown();
 }
 
