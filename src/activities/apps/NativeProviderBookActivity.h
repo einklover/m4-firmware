@@ -23,11 +23,12 @@ class NativeProviderBookActivity final : public ActivityWithSubactivity {
   std::string debugUiJson() override;
 
  private:
-  enum class State { OpeningToc, Toc, Loading, Reader, Error };
+  enum class State { OpeningToc, Toc, Loading, Login, Reader, Error };
 
   bool prepareCatalog();
   void openToc();
   void requestChapter(int index0);
+  void openLogin();
   bool openReadyReader(int index0);
   std::string titleAt(int index0) const;
   void renderLoading(bool force = false);
@@ -49,6 +50,8 @@ class NativeProviderBookActivity final : public ActivityWithSubactivity {
   bool tocSelectionPending_ = false;
   int tocSelectedIndex_ = -1;
   bool readerBackPending_ = false;
+  bool loginFinishedPending_ = false;
+  bool loginSucceeded_ = false;
   uint32_t lastLoadingPaintMs_ = 0;
   std::string lastLoadingSignature_;
 };
