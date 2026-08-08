@@ -26,6 +26,56 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Reconstruct unvendored SDK and libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The firmware intentionally does not commit the developer-machine
+          # symlinks/vendor trees listed in .gitignore. Rebuild that layout
+          # from public upstreams so PR builds are reproducible.
+          git clone --depth 1 https://github.com/Free-Ink/freeink-sdk.git open-m4-sdk
+          git clone --depth 1 https://github.com/crosspoint-reader/crosspoint-reader.git /tmp/crosspoint
+
+          rm -rf lib/Epub lib/expat lib/miniz lib/EpdFont/builtinFonts
+          cp -a /tmp/crosspoint/lib/Epub lib/Epub
+          cp -a /tmp/crosspoint/lib/expat lib/expat
+          cp -a /tmp/crosspoint/lib/miniz lib/miniz
+          cp -a /tmp/crosspoint/lib/EpdFont/builtinFonts lib/EpdFont/builtinFonts
+
+          # picojpeg was removed from newer CrossPoint, while this fork still
+          # builds the older decoder API.
+          curl -fsSL https://github.com/crosspoint-reader/crosspoint-reader/archive/c3093e3.tar.gz -o /tmp/cp-old.tar.gz
+          mkdir -p /tmp/cp-old
+          tar -xzf /tmp/cp-old.tar.gz -C /tmp/cp-old --strip-components=1
+          rm -rf lib/picojpeg
+          cp -a /tmp/cp-old/lib/picojpeg lib/picojpeg
+
+          # Lua is intentionally unvendored in this repository. Stock Lua 5.4
+          # is sufficient for the firmware host; exclude its CLI entry points.
+          curl -fsSL https://www.lua.org/ftp/lua-5.4.8.tar.gz -o /tmp/lua.tar.gz
+          tar -xzf /tmp/lua.tar.gz -C /tmp
+          rm -rf lib/Lua
+          mkdir -p lib/Lua
+          cp -a /tmp/lua-5.4.8/src/. lib/Lua/
+          cat > lib/Lua/library.json <<'JSON'
+          {
+            "name": "Lua",
+            "version": "5.4.8",
+            "build": {
+              "srcFilter": "+<*> -<lua.c> -<luac.c>"
+            }
+          }
+          JSON
+
+          test -f open-m4-sdk/libs/hardware/BatteryMonitor/library.json
+          test -f lib/Epub/Epub.h
+          test -f lib/Lua/lua.h
+          test -f lib/expat/expat.h
+          test -f lib/miniz/miniz.h
+          test -f lib/picojpeg/picojpeg.h
+          test -f lib/EpdFont/builtinFonts/all.h
+
       - name: Install PlatformIO
         run: python -m pip install --disable-pip-version-check platformio==6.1.18
 
