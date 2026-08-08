@@ -6,4 +6,5 @@ class BootActivity final : public Activity {
   explicit BootActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : Activity("Boot", renderer, mappedInput) {}
   void onEnter() override;
+  bool showTouchNavigation() const override { return false; }
 };
