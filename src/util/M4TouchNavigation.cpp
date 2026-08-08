@@ -11,6 +11,7 @@
 namespace M4TouchNavigation {
 namespace {
 std::atomic<uint8_t> gMode{static_cast<uint8_t>(Mode::None)};
+std::atomic<bool> gHeaderBackVisible{false};
 
 void drawBackIcon(const GfxRenderer& renderer, int cx, int cy) {
   // GfxRenderer::drawLine intentionally supports only horizontal/vertical
@@ -47,15 +48,24 @@ void drawHomeIcon(const GfxRenderer& renderer, int cx, int cy) {
   renderer.drawRect(cx - 8, cy + 7, 17, 13, true);
   renderer.fillRect(cx - 2, cy + 13, 5, 7, true);
 }
+
+bool inHeaderBack(int x, int y) {
+  return gHeaderBackVisible.load(std::memory_order_acquire) && x >= 0 && x < kHeaderHitWidth && y >= 0 &&
+         y < kHeaderHitHeight;
+}
 }  // namespace
 
-void setMode(Mode value) { gMode.store(static_cast<uint8_t>(value), std::memory_order_release); }
+void setMode(Mode value) {
+  gMode.store(static_cast<uint8_t>(value), std::memory_order_release);
+  if (value == Mode::None) gHeaderBackVisible.store(false, std::memory_order_release);
+}
 
 Mode mode() { return static_cast<Mode>(gMode.load(std::memory_order_acquire)); }
 
 bool enabled() { return mode() != Mode::None; }
 
 void activateForActivity(bool showNavigation) {
+  gHeaderBackVisible.store(false, std::memory_order_release);
 #if defined(CROSSPOINT_MURPHY_M4)
   setMode(showNavigation ? Mode::HeaderBack : Mode::None);
 #else
@@ -66,12 +76,11 @@ void activateForActivity(bool showNavigation) {
 
 bool hitBack(int x, int y, int screenWidth, int screenHeight) {
   const Mode m = mode();
-  if (m == Mode::HeaderBack) {
-    return x >= 0 && x < kHeaderHitWidth && y >= 0 && y < kHeaderHitHeight;
-  }
+  if (m == Mode::HeaderBack) return inHeaderBack(x, y);
   if (m == Mode::BottomBackHome) {
     const int top = screenHeight - kBottomBarHeight;
-    return y >= top && y < screenHeight && x >= 0 && x < screenWidth / 2;
+    const bool bottomBack = y >= top && y < screenHeight && x >= 0 && x < screenWidth / 2;
+    return bottomBack || inHeaderBack(x, y);
   }
   return false;
 }
@@ -84,11 +93,15 @@ bool hitHome(int x, int y, int screenWidth, int screenHeight) {
 
 void drawHeaderBack(const GfxRenderer& renderer, const Rect& headerRect) {
 #if defined(CROSSPOINT_MURPHY_M4)
-  if (mode() != Mode::HeaderBack || headerRect.width <= 0 || headerRect.height <= 0) return;
+  if (!enabled() || headerRect.width <= 0 || headerRect.height <= 0) return;
   // Visible icon stays inside the theme's existing left padding; hit area is
   // 56x56, so the control remains easy to tap without changing list geometry.
   const int cy = headerRect.y + headerRect.height / 2 - 2;
   drawHeaderBackIcon(renderer, headerRect.x + 4, cy);
+  gHeaderBackVisible.store(true, std::memory_order_release);
+#else
+  (void)renderer;
+  (void)headerRect;
 #endif
 }
 
