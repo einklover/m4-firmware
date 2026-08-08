@@ -1,7 +1,9 @@
 #pragma once
 
 // Unified UI text face for Murphy M4. UI and reader content share the selected
-// TTF family, but UI uses fixed cached face sizes independent of reader size.
+// runtime TTF face: only the reader-size rasterizer/cache is resident and UI
+// chrome shrinks those cached glyph bitmaps to its compact layout metrics.
+// Legacy epdfont keeps its existing fixed-size lookup behavior.
 //
 // Pure policy: M4UiTextPolicy.h (host-testable).
 // Drawing helpers: this header (device / sim with GfxRenderer).
@@ -11,6 +13,7 @@
 #include <EpdFontLoader.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -21,20 +24,42 @@
 
 namespace M4UiText {
 
-// UI sizes are independent from the reader size and are loaded into the same
-// glyph cache as the reader faces. The slightly larger source faces compensate
-// for the compact built-in UI metrics without a post-rasterization scale.
+// Legacy generated epdfont chrome sizes. Runtime .ttf deliberately does NOT
+// load these faces; it uses the current reader face and GfxRenderer scaling.
 inline int uiTtfSizeForLayout(int layoutFontId) {
   return layoutFontId == UI_10_FONT_ID ? 20 : 24;
 }
 
-// Runtime resolve against GfxRenderer + SETTINGS reader id.
+inline bool selectedRuntimeTtf() {
+  if (SETTINGS.fontFamily != CrossPointSettings::FONT_CUSTOM || SETTINGS.customFontFamily[0] == '\0') {
+    return false;
+  }
+  std::string name = SETTINGS.customFontFamily;
+  if (name.size() < 4) return false;
+  std::string ext = name.substr(name.size() - 4);
+  std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return ext == ".ttf";
+}
+
+// Runtime resolve against GfxRenderer + SETTINGS reader id. For a selected TTF
+// this is the central single-face policy: all UI/status text references exactly
+// the same font ID/cache as reader body text, then scales it down to the target
+// layout face's ascender. No second TTF parser, cmap, stream, mutex or glyph LRU.
 inline Face resolve(const GfxRenderer& renderer, int layoutFontId) {
-  (void)renderer;
   Face f;
   f.layoutFontId = (layoutFontId == 0) ? UI_12_FONT_ID : layoutFontId;
   f.fontId = f.layoutFontId;
   f.scale = 1.0f;
+
+  if (selectedRuntimeTtf()) {
+    const int readerFontId = SETTINGS.getReaderFontId();
+    if (readerFontId != -1 && renderer.hasFont(readerFontId)) {
+      f.fontId = readerFontId;
+      f.scale = renderer.scaleFontToMatch(readerFontId, f.layoutFontId);
+    }
+  }
   return f;
 }
 
@@ -46,12 +71,23 @@ inline Face resolveForText(const GfxRenderer& renderer, int layoutFontId, const 
     return f;
   }
 
-  // Use a fixed cached face for chrome, so changing reader size does not
-  // change menu/button text and no runtime bitmap scaling is needed.
+  const char* safeText = text ? text : "";
+  if (selectedRuntimeTtf()) {
+    // Reuse reader TTF only when it really covers the label. TTF backends may
+    // synthesize '?' for misses, so hasTextGlyphs prevents silent tofu chrome.
+    if (f.fontId != f.layoutFontId && renderer.hasTextGlyphs(f.fontId, safeText, style)) {
+      return f;
+    }
+    f.fontId = f.layoutFontId;
+    f.scale = 1.0f;
+    return f;
+  }
+
+  // Legacy epdfont: preserve existing fixed chrome-face behavior.
   const int uiFont = EpdFontLoader::getBestFontId(
       SETTINGS.customFontFamily, uiTtfSizeForLayout(f.layoutFontId));
   if (uiFont != -1 && renderer.hasFont(uiFont) &&
-      renderer.hasTextGlyphs(uiFont, text ? text : "", style)) {
+      renderer.hasTextGlyphs(uiFont, safeText, style)) {
     f.fontId = uiFont;
   }
   return f;
@@ -121,7 +157,8 @@ inline int listIconTop(const GfxRenderer& renderer, int layoutFontId, int rowHei
   return std::max(0, blockCenter - iconSize / 2);
 }
 
-// Chapter-list style row: always use reader face scaled to chrome metrics.
+// Chapter-list style row: use the same runtime reader face scaled to chrome
+// metrics (or the layout face when no runtime TTF is selected).
 inline Face resolveChapterRow(const GfxRenderer& renderer, int chromeFontId) {
   return resolve(renderer, chromeFontId);
 }
