@@ -24,8 +24,8 @@ class MappedInputManager {
   explicit MappedInputManager(HalGPIO& gpio);
 
   void update() const { gpio.update(); }
-  // Call once per main-loop frame after gpio.update() so swipe is decoded once
-  // and synthetic back is cleared for the new frame.
+  // Call once per main-loop frame after gpio.update() so touch/swipe events are
+  // decoded once and can be read by both system navigation and the activity.
   void beginFrame();
   bool wasPressed(Button button) const;
   bool wasReleased(Button button) const;
@@ -52,9 +52,12 @@ class MappedInputManager {
                     int rowHeight = 0) const;
   SwipeDir wasSwipe() const;
   bool wasMenuGesture() const;
-  // Right-edge swipe left → system back (also pulses synthetic Back button).
+  // Right-edge swipe left → system back. On M4 non-reader chrome, the explicit
+  // Back control is reported through this same path so the main loop can keep
+  // using its existing synthetic-Back routing.
   bool wasBackGesture() const;
-  // Bottom-edge swipe up → system home (phone full-screen style).
+  // Bottom-edge swipe up → system home. On touch screens with the shared
+  // bottom navigation bar, tapping Home is reported through this same path.
   bool wasHomeGesture() const;
   // Make wasPressed/wasReleased(Back) true this frame so every activity's button
   // path handles edge-back without per-page wiring.
@@ -73,6 +76,12 @@ class MappedInputManager {
  private:
   HalGPIO& gpio;
   const GfxRenderer* renderer = nullptr;
+
+  // Per-frame tap cache. Global navigation checks run before activity loop();
+  // caching prevents those checks from consuming an ordinary list/button tap.
+  mutable bool tapCacheValid = false;
+  mutable bool tapCacheHas = false;
+  mutable int tapX = 0, tapY = 0;
 
   // Per-frame swipe cache (wasSwipe is multi-readable within one frame)
   mutable bool swipeCacheValid = false;
