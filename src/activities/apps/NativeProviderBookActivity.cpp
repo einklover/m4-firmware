@@ -1,6 +1,8 @@
 #include "NativeProviderBookActivity.h"
 #include "NativeProviderLoginActivity.h"
 
+#include "MappedInputManager.h"
+
 #include "activities/reader/TxtReaderActivity.h"
 #include "activities/reader/TxtReaderChapterSelectionActivity.h"
 #include "apps/M4ContentProviderSession.h"

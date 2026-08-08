@@ -41,6 +41,18 @@ struct Result {
 using ProgressFn = std::function<void(size_t bytes)>;
 using CancelFn = std::function<bool()>;
 
+// Bridges a streaming HTTP body into a ScalarStreamExtractor: requestToSink
+// feeds raw bytes to the extractor, which parses the JSON and writes only the
+// target scalar into its own Sink (file).
+class ExtractorSink final : public M4xJsonStream::Sink {
+ public:
+  ExtractorSink(M4xJsonStream::ScalarStreamExtractor& extractor) : extractor_(extractor) {}
+  bool write(const uint8_t* data, size_t len) override { return extractor_.feed(data, len); }
+
+ private:
+  M4xJsonStream::ScalarStreamExtractor& extractor_;
+};
+
 // Synchronous, bounded-body streaming request intended to run on the single
 // native provider worker task. The body is never accumulated: HTTPClient
 // decodes transfer framing and writes directly into SinkStream -> Sink.

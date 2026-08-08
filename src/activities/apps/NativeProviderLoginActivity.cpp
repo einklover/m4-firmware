@@ -1,5 +1,6 @@
 #include "NativeProviderLoginActivity.h"
 
+#include "MappedInputManager.h"
 #include "apps/providers/M4NativeProviderLogin.h"
 #include "components/UITheme.h"
 #include "fontIds.h"

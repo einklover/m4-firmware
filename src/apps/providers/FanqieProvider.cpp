@@ -39,6 +39,7 @@ class FanqieProvider final : public M4NativeProvider::Adapter {
       return out;
     }
     M4xJsonStream::ScalarStreamExtractor scalar({"data", "data"}, "content", file);
+    M4NativeProviderHttp::ExtractorSink sink(scalar);
 
     M4NativeProviderHttp::Request http;
     http.method = "GET";
@@ -58,7 +59,7 @@ class FanqieProvider final : public M4NativeProvider::Adapter {
 
     if (progress) progress(M4NativeProvider::Phase::Connecting, 0, 0, 0);
     const auto res = M4NativeProviderHttp::requestToSink(
-        http, scalar,
+        http, sink,
         [&](size_t received) {
           if (progress) progress(M4NativeProvider::Phase::Receiving, received, file.written(), 0);
         },

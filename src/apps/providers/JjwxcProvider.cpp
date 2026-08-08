@@ -357,6 +357,7 @@ class JjwxcProvider final : public M4NativeProvider::Adapter {
       return out;
     }
     M4xJsonStream::ScalarStreamExtractor scalar({}, "content", file);
+    M4NativeProviderHttp::ExtractorSink sink(scalar);
     M4NativeProviderHttp::Request http;
     http.url = std::string("https://app-cdn.jjwxc.net/androidapi/chapterContent?novelId=") + req.book.bookId +
                "&chapterId=" + req.chapter.uid;
@@ -365,7 +366,7 @@ class JjwxcProvider final : public M4NativeProvider::Adapter {
     http.timeoutMs = 45000;
     if (progress) progress(M4NativeProvider::Phase::Connecting, 0, 0, 0);
     const auto net = M4NativeProviderHttp::requestToSink(
-        http, scalar,
+        http, sink,
         [&](size_t n) {
           if (progress) progress(M4NativeProvider::Phase::Receiving, n, file.written(), 0);
         }, cancelled);
