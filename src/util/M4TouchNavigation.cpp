@@ -1,0 +1,113 @@
+#include "util/M4TouchNavigation.h"
+
+#include <GfxRenderer.h>
+
+#include <atomic>
+
+#include "components/themes/BaseTheme.h"
+#include "fontIds.h"
+#include "util/M4UiText.h"
+
+namespace M4TouchNavigation {
+namespace {
+std::atomic<uint8_t> gMode{static_cast<uint8_t>(Mode::None)};
+
+void drawBackIcon(const GfxRenderer& renderer, int cx, int cy) {
+  // GfxRenderer::drawLine intentionally supports only horizontal/vertical
+  // lines. Draw the chevron explicitly so this stays cheap and deterministic.
+  for (int i = 0; i <= 9; ++i) {
+    renderer.drawPixel(cx - i, cy - i, true);
+    renderer.drawPixel(cx - i, cy - i + 1, true);
+    renderer.drawPixel(cx - i, cy + i, true);
+    renderer.drawPixel(cx - i, cy + i + 1, true);
+  }
+  renderer.fillRect(cx - 8, cy, 23, 2, true);
+}
+
+void drawHomeIcon(const GfxRenderer& renderer, int cx, int cy) {
+  // Roof (two 45-degree strokes) + rectangular body. No font glyph is needed
+  // for the icon, so navigation remains recognizable during font failures.
+  for (int i = 0; i <= 9; ++i) {
+    renderer.drawPixel(cx - i, cy - 2 + i, true);
+    renderer.drawPixel(cx + i, cy - 2 + i, true);
+    renderer.drawPixel(cx - i, cy - 1 + i, true);
+    renderer.drawPixel(cx + i, cy - 1 + i, true);
+  }
+  renderer.drawRect(cx - 8, cy + 7, 17, 13, true);
+  renderer.fillRect(cx - 2, cy + 13, 5, 7, true);
+}
+}  // namespace
+
+void setMode(Mode value) { gMode.store(static_cast<uint8_t>(value), std::memory_order_release); }
+
+Mode mode() { return static_cast<Mode>(gMode.load(std::memory_order_acquire)); }
+
+bool enabled() { return mode() != Mode::None; }
+
+void activateForActivity(bool showNavigation) {
+#if defined(CROSSPOINT_MURPHY_M4)
+  setMode(showNavigation ? Mode::HeaderBack : Mode::None);
+#else
+  (void)showNavigation;
+  setMode(Mode::None);
+#endif
+}
+
+bool hitBack(int x, int y, int screenWidth, int screenHeight) {
+  const Mode m = mode();
+  if (m == Mode::HeaderBack) {
+    return x >= 0 && x < kHeaderHitWidth && y >= 0 && y < kHeaderHitHeight;
+  }
+  if (m == Mode::BottomBackHome) {
+    const int top = screenHeight - kBottomBarHeight;
+    return y >= top && y < screenHeight && x >= 0 && x < screenWidth / 2;
+  }
+  return false;
+}
+
+bool hitHome(int x, int y, int screenWidth, int screenHeight) {
+  if (mode() != Mode::BottomBackHome) return false;
+  const int top = screenHeight - kBottomBarHeight;
+  return y >= top && y < screenHeight && x >= screenWidth / 2 && x < screenWidth;
+}
+
+void drawHeaderBack(const GfxRenderer& renderer, const Rect& headerRect) {
+#if defined(CROSSPOINT_MURPHY_M4)
+  if (mode() != Mode::HeaderBack || headerRect.width <= 0 || headerRect.height <= 0) return;
+  // Keep the visible icon inside the theme's existing left padding. The hit
+  // area is much larger (56x56), so it is finger-friendly without consuming
+  // title width or changing list geometry.
+  const int cx = headerRect.x + 13;
+  const int cy = headerRect.y + headerRect.height / 2 - 2;
+  drawBackIcon(renderer, cx + 5, cy);
+#endif
+}
+
+void drawBottomBar(GfxRenderer& renderer) {
+#if defined(CROSSPOINT_MURPHY_M4)
+  if (!enabled()) return;
+  setMode(Mode::BottomBackHome);
+
+  const int w = renderer.getScreenWidth();
+  const int h = renderer.getScreenHeight();
+  const int top = h - kBottomBarHeight;
+  if (top < 0) return;
+
+  // Replace legacy hardware-only hints with a high-contrast, stable touch bar.
+  // The standard layouts already reserve roughly this much footer space.
+  renderer.fillRect(0, top, w, kBottomBarHeight, false);
+  renderer.drawLine(0, top, w - 1, top, true);
+  renderer.drawLine(w / 2, top + 7, w / 2, h - 7, true);
+
+  const int iconY = top + 18;
+  drawBackIcon(renderer, w / 4 - 30, iconY);
+  drawHomeIcon(renderer, 3 * w / 4 - 30, iconY - 7);
+
+  M4UiText::draw(renderer, UI_10_FONT_ID, w / 4 - 8, top + 12, "返回", true);
+  M4UiText::draw(renderer, UI_10_FONT_ID, 3 * w / 4 - 8, top + 12, "主页", true);
+#else
+  (void)renderer;
+#endif
+}
+
+}  // namespace M4TouchNavigation
