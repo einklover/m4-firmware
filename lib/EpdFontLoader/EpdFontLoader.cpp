@@ -3,6 +3,7 @@
 #include <HardwareSerial.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -140,15 +141,15 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
   }
 
   if (!reuseRuntimeTtf) {
-    // Old custom mappings are value-copies of families containing raw EpdFont
-    // pointers. Drop the renderer aliases before FontManager forgets/reloads
-    // them so a newly selected family/size cannot be shadowed by insert-only IDs.
+    // Renderer stores EpdFontFamily value-copies with raw EpdFont pointers.
+    // Remove those aliases first, then fully destroy runtime TTF faces (stream,
+    // cmap, scratch and PSRAM metadata). Legacy epdfont keeps its historical
+    // mixed-ownership clear behavior.
     for (int id : previousCustomIds) renderer.removeFont(id);
+    FontManager::getInstance().releaseRuntimeTtfFaces();
     FontManager::getInstance().clearLoadedFonts();
-    if (!runtimeTtf) {
-      activeRuntimeTtfFamily.clear();
-      activeRuntimeTtfSize = -1;
-    }
+    activeRuntimeTtfFamily.clear();
+    activeRuntimeTtfSize = -1;
   } else {
     Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx (UI scales this same cache)\n",
                   d.loadCustomFamily.c_str(), runtimeReaderSize);
@@ -220,6 +221,7 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
 
   // Non-M4: original behavior — reload only the selected custom face.
   for (int id : previousCustomIds) renderer.removeFont(id);
+  FontManager::getInstance().releaseRuntimeTtfFaces();
   FontManager::getInstance().clearLoadedFonts();
   if (SETTINGS.fontFamily == CrossPointSettings::FONT_CUSTOM) {
     if (strlen(SETTINGS.customFontFamily) > 0) {
