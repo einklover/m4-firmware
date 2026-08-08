@@ -41,9 +41,6 @@ jobs:
             tar -xzf "$tarball" -C "$dst" --strip-components=1
           }
 
-          # These trees are deliberately omitted from the firmware repository.
-          # Use archive downloads rather than nested git clones so checkout's
-          # repository auth header cannot interfere with public upstream fetches.
           fetch_tree \
             https://github.com/Free-Ink/freeink-sdk/archive/refs/heads/main.tar.gz \
             open-m4-sdk /tmp/freeink.tar.gz
@@ -62,8 +59,6 @@ jobs:
           cp -a /tmp/crosspoint/lib/miniz lib/miniz
           cp -a /tmp/crosspoint/lib/EpdFont/builtinFonts lib/EpdFont/builtinFonts
 
-          # picojpeg was removed from newer CrossPoint, while this fork still
-          # builds the older decoder API. Pull it from the v1.1.0 release commit.
           fetch_tree \
             https://github.com/crosspoint-reader/crosspoint-reader/archive/c3093e3.tar.gz \
             /tmp/cp-old /tmp/cp-old.tar.gz
@@ -71,8 +66,6 @@ jobs:
           rm -rf lib/picojpeg
           cp -a /tmp/cp-old/lib/picojpeg lib/picojpeg
 
-          # Lua is intentionally unvendored in this repository. Stock Lua 5.4
-          # supplies the VM ABI used by M4xLuaHost; exclude command-line mains.
           curl -fL --retry 3 --retry-delay 2 https://www.lua.org/ftp/lua-5.4.8.tar.gz -o /tmp/lua.tar.gz
           tar -xzf /tmp/lua.tar.gz -C /tmp
           rm -rf lib/Lua
@@ -88,13 +81,13 @@ jobs:
           }
           JSON
 
-          # Fail here with an explicit missing path rather than an opaque PIO error.
           for p in \
             open-m4-sdk/libs/hardware/BatteryMonitor/library.json \
             lib/Epub/Epub.h \
             lib/Lua/lua.h \
             lib/expat/expat.h \
-            lib/miniz/miniz.h \
+            lib/miniz/src/MinizConfig.h \
+            lib/miniz/third_party/miniz.h \
             lib/picojpeg/picojpeg.h \
             lib/EpdFont/builtinFonts/all.h; do
             test -f "$p" || { echo "missing reconstructed dependency: $p"; exit 2; }
