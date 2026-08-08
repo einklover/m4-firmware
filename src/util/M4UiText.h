@@ -73,13 +73,27 @@ inline Face resolveForText(const GfxRenderer& renderer, int layoutFontId, const 
 
   const char* safeText = text ? text : "";
   if (selectedRuntimeTtf()) {
-    // Reuse reader TTF only when it really covers the label. TTF backends may
-    // synthesize '?' for misses, so hasTextGlyphs prevents silent tofu chrome.
+    // Reuse the single reader TTF when it covers the label. A runtime TTF may
+    // synthesize '?' for a miss, so hasTextGlyphs must decide before rendering.
     if (f.fontId != f.layoutFontId && renderer.hasTextGlyphs(f.fontId, safeText, style)) {
       return f;
     }
-    f.fontId = f.layoutFontId;
-    f.scale = 1.0f;
+
+    // True fallback must not use UI_10/UI_12/SMALL: in runtime-TTF mode those
+    // IDs are scaled views over the same reader face. Prefer the independent
+    // NOTOSANS_12 mapping (canonical epdfont when available, builtin subset
+    // otherwise), scaled to the requested chrome metrics.
+    constexpr int fallbackId = NOTOSANS_12_FONT_ID;
+    if (renderer.hasFont(fallbackId) && fallbackId != f.fontId &&
+        renderer.hasTextGlyphs(fallbackId, safeText, style)) {
+      f.fontId = fallbackId;
+      f.scale = renderer.scaleFontToMatch(fallbackId, f.layoutFontId);
+      return f;
+    }
+
+    // No independent fallback covers the label; keep the selected reader TTF
+    // and let its normal '?' behavior surface rather than double-scaling its
+    // UI wrapper or allocating another TTF face.
     return f;
   }
 
