@@ -68,6 +68,15 @@ class GfxRenderer {
   // Explicit replace/upsert for M4 full-CJK epdfont promotion of NOTOSANS/UI IDs.
   void replaceFont(int fontId, EpdFontFamily font);
   bool hasFont(int fontId) const;
+  // Borrow the currently mapped font object. Used by the M4 runtime-TTF loader
+  // to capture the compact builtin UI faces before installing scaled views.
+  // The renderer keeps ownership of the family mapping; callers must not free
+  // the returned font.
+  const EpdFont* getFontPtr(int fontId,
+                           EpdFontFamily::Style style = EpdFontFamily::REGULAR) const {
+    const auto it = fontMap.find(fontId);
+    return it == fontMap.end() ? nullptr : it->second.getFont(style);
+  }
   // Remove a transient/custom mapping before a font reload. The owning font
   // object is managed by FontManager; erasing the value copy only drops the
   // renderer's pointer aliases.
