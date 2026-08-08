@@ -130,7 +130,7 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   // maxReadBytes: exclusive read-window size from offset (0 = default CHUNK_SIZE 8KiB).
   // First-page adaptive path passes growing 8/16/.../48KiB so expansion is real, not a re-read of 8KiB.
   // outJustify: if non-null, write per-line justify flags there; if null, write currentPageJustify.
-  // Index builders MUST pass a scratch vector so progressive index does not clobber the
+  // Index builders MUST pass a scratch vector so progressive indexing does not clobber the
   // on-screen page's justify flags (causes mid-read left/justify flicker).
   bool loadPageAtOffset(size_t offset, size_t endoffset, std::vector<std::string>& outLines, size_t& nextOffset,
                         const uint8_t* preloadBuf = nullptr, size_t preloadBufOffset = 0, size_t preloadBufSize = 0,
@@ -211,6 +211,9 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
     bool value = false;
     bool* pendingGoBack = nullptr;
     int* switchChapterIndex = nullptr;
+
+    PluginCloseFlag(bool* goBack, int* switchIndex)
+        : value(false), pendingGoBack(goBack), switchChapterIndex(switchIndex) {}
 
     PluginCloseFlag& operator=(bool v) {
       value = v;
