@@ -219,6 +219,12 @@ class ProviderController final : public BaseController {
       return M4NativeUi::ActionResult::openProviderBook(
           M4ContentProvider::makeHistoryUri(app_.provider.c_str(), ctx.rowKey.c_str()));
     }
+    if (action == "provider.login") {
+      M4NativeUi::ActionResult r;
+      r.kind = M4NativeUi::ActionKind::OpenLogin;
+      r.payload = app_.provider;
+      return r;
+    }
     if (action == "provider.refresh") {
       M4NativeUi::ActionResult r;
       r.kind = M4NativeUi::ActionKind::Error;
