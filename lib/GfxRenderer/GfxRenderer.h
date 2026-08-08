@@ -68,6 +68,10 @@ class GfxRenderer {
   // Explicit replace/upsert for M4 full-CJK epdfont promotion of NOTOSANS/UI IDs.
   void replaceFont(int fontId, EpdFontFamily font);
   bool hasFont(int fontId) const;
+  // Remove a transient/custom mapping before a font reload. The owning font
+  // object is managed by FontManager; erasing the value copy only drops the
+  // renderer's pointer aliases.
+  void removeFont(int fontId) { fontMap.erase(fontId); }
   // Exact coverage check used by plugin/UI text mapping.  Font backends may
   // return '?' for a missing glyph, so this distinguishes real coverage from
   // that fallback before choosing the reader face.
