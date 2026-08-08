@@ -1,0 +1,57 @@
+#pragma once
+
+#include "apps/M4xJsonStream.h"
+
+#include <SDCardManager.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace M4NativeProviderIo {
+
+bool ensureParentDirs(const std::string& absPath);
+bool cacheComplete(const std::string& absPath, size_t* sizeOut = nullptr);
+bool removeIncomplete(const std::string& absPath);
+bool commitPart(const std::string& absPath, size_t* sizeOut = nullptr);
+
+class PartFileSink final : public M4xJsonStream::Sink {
+ public:
+  PartFileSink() = default;
+  ~PartFileSink() override { close(); }
+  PartFileSink(const PartFileSink&) = delete;
+  PartFileSink& operator=(const PartFileSink&) = delete;
+
+  bool open(const std::string& finalAbsPath);
+  bool write(const uint8_t* data, size_t len) override;
+  bool flush();
+  void close();
+  size_t written() const { return written_; }
+  const std::string& finalPath() const { return finalPath_; }
+  const std::string& partPath() const { return partPath_; }
+
+ private:
+  bool flushBuffer();
+  static constexpr size_t kBufferBytes = 8u * 1024u;
+  FsFile file_;
+  std::string finalPath_;
+  std::string partPath_;
+  uint8_t* buffer_ = nullptr;
+  size_t used_ = 0;
+  size_t written_ = 0;
+  bool open_ = false;
+};
+
+// Compatibility credential reader for existing plugin config.json files.
+// Secrets stay in native memory and are never returned to XML or log output.
+bool loadCookieHeader(const std::string& appDataRoot, const std::string& providerId,
+                      std::string& cookieOut);
+bool hasCredential(const std::string& appDataRoot, const std::string& providerId);
+
+// Merge collected Set-Cookie lines back into the existing config.json cookie
+// object. Used by native auth renewal/login adapters; values must never be logged.
+bool mergeSetCookies(const std::string& appDataRoot, const std::string& providerId,
+                     const std::vector<std::string>& setCookieLines);
+
+}  // namespace M4NativeProviderIo
