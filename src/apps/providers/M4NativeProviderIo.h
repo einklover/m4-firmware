@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace M4NativeProviderIo {
@@ -53,5 +54,12 @@ bool hasCredential(const std::string& appDataRoot, const std::string& providerId
 // object. Used by native auth renewal/login adapters; values must never be logged.
 bool mergeSetCookies(const std::string& appDataRoot, const std::string& providerId,
                      const std::vector<std::string>& setCookieLines);
+
+// Store explicit credential values from a verified login response. This is a
+// fallback for services that expose the session identifiers in JSON when the
+// HTTP client cannot surface every repeated Set-Cookie line. Empty values are
+// ignored; callers must never log this vector.
+bool storeCookieValues(const std::string& appDataRoot,
+                       const std::vector<std::pair<std::string, std::string>>& values);
 
 }  // namespace M4NativeProviderIo
