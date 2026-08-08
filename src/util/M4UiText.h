@@ -71,32 +71,23 @@ inline Face resolveForText(const GfxRenderer& renderer, int layoutFontId, const 
     return f;
   }
 
-  const char* safeText = text ? text : "";
   if (selectedRuntimeTtf()) {
-    // Reuse the single reader TTF when it covers the label. A runtime TTF may
-    // synthesize '?' for a miss, so hasTextGlyphs must decide before rendering.
-    if (f.fontId != f.layoutFontId && renderer.hasTextGlyphs(f.fontId, safeText, style)) {
-      return f;
+    // A selected runtime TTF is authoritative for both reader and UI. Do not
+    // switch the entire label to NOTOSANS_12 merely because a coverage probe is
+    // inconclusive: on Murphy M4 that ID may be the tiny OMIT_FONTS built-in
+    // subset, making a full user TTF appear to lose exactly the same Chinese
+    // characters as the emergency system font. The compact UI IDs are already
+    // ScaledEpdFont views over this same TTF face, so falling back to the layout
+    // ID keeps the chosen TTF rather than crossing into the emergency subset.
+    if (f.fontId != f.layoutFontId && renderer.hasFont(f.fontId)) return f;
+    if (renderer.hasFont(f.layoutFontId)) {
+      f.fontId = f.layoutFontId;
+      f.scale = 1.0f;
     }
-
-    // True fallback must not use UI_10/UI_12/SMALL: in runtime-TTF mode those
-    // IDs are scaled views over the same reader face. Prefer the independent
-    // NOTOSANS_12 mapping (canonical epdfont when available, builtin subset
-    // otherwise), scaled to the requested chrome metrics.
-    constexpr int fallbackId = NOTOSANS_12_FONT_ID;
-    if (renderer.hasFont(fallbackId) && fallbackId != f.fontId &&
-        renderer.hasTextGlyphs(fallbackId, safeText, style)) {
-      f.fontId = fallbackId;
-      f.scale = renderer.scaleFontToMatch(fallbackId, f.layoutFontId);
-      return f;
-    }
-
-    // No independent fallback covers the label; keep the selected reader TTF
-    // and let its normal '?' behavior surface rather than double-scaling its
-    // UI wrapper or allocating another TTF face.
     return f;
   }
 
+  const char* safeText = text ? text : "";
   // Legacy epdfont: preserve existing fixed chrome-face behavior.
   const int uiFont = EpdFontLoader::getBestFontId(
       SETTINGS.customFontFamily, uiTtfSizeForLayout(f.layoutFontId));

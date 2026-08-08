@@ -3,6 +3,7 @@
 // Thread-safe handoff queue between Lua owner task and AppRuntime UI task.
 
 #include "util/M4PluginReaderBridge.h"
+#include "apps/providers/M4NativeProviderManager.h"
 
 #include <atomic>
 #include <cstring>
@@ -21,11 +22,8 @@ struct ProgressSnapshot {
   char progressKey[M4PluginReaderBridge::kMaxProgressKeyLen + 1] = {};
   bool pendingDeliver = false;
   uint32_t generation = 0;
-  // Non-empty when native open/load/encoding failed (not a successful close).
   char error[32] = {};
   bool openFailed = false;
-  // When >= 0: user picked another book chapter from system TOC while reading.
-  // 0-based index into the plugin's toc.json chapter list.
   int switchChapterIndex = -1;
 };
 
@@ -44,12 +42,6 @@ inline std::atomic<bool>& openReady() {
   return v;
 }
 
-// Provider cross-chapter fallback. A native reader can discover that chapter
-// N+1 is not locally openable yet (missing/fetching/empty/corrupt cache). The
-// reader-side handoff intentionally has no resolved absPath; a real Lua
-// reader.openText / progressive-loader request resolves and validates absPath
-// before queueOpen. Remember only the target chapter index here, then reuse the
-// already-working chapter-picker close -> loading/download -> reopen path.
 inline std::atomic<int>& fallbackSwitchChapterIndex() {
   static std::atomic<int> v{-1};
   return v;
@@ -63,8 +55,6 @@ inline int takeFallbackSwitchChapterIndex() {
   return fallbackSwitchChapterIndex().exchange(-1, std::memory_order_acq_rel);
 }
 
-// True from takeOpen until tryLaunch finishes enter/fail — blocks concurrent
-// Lua displayBuffer that would race the native reader display task on e-ink.
 inline std::atomic<bool>& launchInProgress() {
   static std::atomic<bool> v{false};
   return v;
@@ -87,26 +77,22 @@ inline std::string& boundAppId() {
 
 inline uint32_t bumpGeneration() { return generation().fetch_add(1, std::memory_order_relaxed) + 1; }
 
-// Native system chapter list (plugin WeRead TOC) handoff — same owner-task rules as openText.
 struct TocRequest {
   std::string tocRelPath;
   std::string tocAbsPath;
-  // File-backed ContentProvider catalogs may not have a JSON toc file.  In
-  // that case the owner task resolves providerId + bookId against the
-  // registry and materializes only the bounded native-picker title list.
   std::string providerId;
   std::string appDataRoot;
   std::string bookTitle;
   std::string bookId;
   std::string appId;
-  int currentIndex = 0;  // 0-based
+  int currentIndex = 0;
   uint32_t generation = 0;
 };
 
 struct TocResult {
   bool pendingDeliver = false;
   bool cancelled = true;
-  int chapterIndex = -1;  // 0-based when selected
+  int chapterIndex = -1;
   char bookId[M4PluginReaderBridge::kMaxIdLen + 1] = {};
   uint32_t generation = 0;
 };
@@ -156,21 +142,30 @@ inline void clearForApp(const std::string& appId) {
   pendingToc() = {};
   progressSlot() = {};
   tocResultSlot() = {};
-  // Bump generation so in-flight readers become stale.
   generation().fetch_add(1, std::memory_order_relaxed);
 }
 
 inline bool queueOpen(const M4PluginReaderBridge::OpenRequest& req) {
-  std::lock_guard<std::mutex> lock(mu());
-  if (!boundAppId().empty() && req.appId != boundAppId()) {
-    return false;
+  // Native provider chapter-end handoff: do not manufacture the legacy
+  // close->Lua fallback. The reader already queued ContentProvider work;
+  // ensureChapter starts the single native worker and keeps TxtReader resident.
+  // A subsequent tap (or native picker path) can switch immediately once the
+  // ChapterStatus becomes Ready. No Lua/TLS overlap is introduced.
+  if (!req.providerId.empty() && req.chapterIndex >= 0 && req.absPath.empty() &&
+      M4NativeProviderManager::supports(req.providerId)) {
+    if (M4NativeProviderManager::ensureChapter(req.providerId, req.bookId, req.chapterIndex, true)) {
+      std::lock_guard<std::mutex> lock(mu());
+      openReady().store(false, std::memory_order_relaxed);
+      pendingOpen() = {};
+      fallbackSwitchChapterIndex().store(-1, std::memory_order_release);
+      return true;
+    }
   }
 
-  // Provider reader-side chapter-end fallback. A request with provider/index
-  // but without an already-resolved absolute file is not a safe native open.
-  // This includes both an empty cache path and a non-empty cache path that the
-  // native reader already tried and rejected as empty/corrupt. Real Lua opens
-  // always resolve+validate absPath first, so they remain normal queueOpen work.
+  std::lock_guard<std::mutex> lock(mu());
+  if (!boundAppId().empty() && req.appId != boundAppId()) return false;
+
+  // Compatibility fallback for providers without a native adapter.
   if (!req.providerId.empty() && req.chapterIndex >= 0 && req.absPath.empty()) {
     openReady().store(false, std::memory_order_relaxed);
     pendingOpen() = {};
@@ -180,9 +175,7 @@ inline bool queueOpen(const M4PluginReaderBridge::OpenRequest& req) {
     return true;
   }
 
-  // A real open supersedes any old fallback intent.
   fallbackSwitchChapterIndex().store(-1, std::memory_order_release);
-  // Prefer reader open; drop any pending TOC so we never dual-launch.
   tocReady().store(false, std::memory_order_relaxed);
   pendingToc() = {};
   pendingOpen() = req;
@@ -196,19 +189,14 @@ inline bool takeOpen(M4PluginReaderBridge::OpenRequest& out) {
   if (!openReady().load(std::memory_order_relaxed)) return false;
   out = pendingOpen();
   openReady().store(false, std::memory_order_relaxed);
-  // Mark launch busy before releasing lock so the other thread cannot
-  // displayBuffer between takeOpen and enterNewActivity.
   launchInProgress().store(true, std::memory_order_release);
   return true;
 }
 
 inline bool queueToc(const TocRequest& req) {
   std::lock_guard<std::mutex> lock(mu());
-  if (!boundAppId().empty() && req.appId != boundAppId()) {
-    return false;
-  }
+  if (!boundAppId().empty() && req.appId != boundAppId()) return false;
   fallbackSwitchChapterIndex().store(-1, std::memory_order_release);
-  // Drop pending reader open if TOC is requested (shelf → TOC path).
   openReady().store(false, std::memory_order_relaxed);
   pendingOpen() = {};
   pendingToc() = req;
@@ -226,15 +214,10 @@ inline bool takeToc(TocRequest& out) {
   return true;
 }
 
-inline void clearLaunchInProgress() {
-  launchInProgress().store(false, std::memory_order_release);
-}
+inline void clearLaunchInProgress() { launchInProgress().store(false, std::memory_order_release); }
 
-// openText / openToc accepted or tryLaunch mid-flight: Lua must not paint/display.
-// (Lua paint over native handoff races e-ink BUSY and leaves residual loading UI.)
 inline bool handoffBlocksLuaDisplay() {
-  return openReady().load(std::memory_order_acquire) ||
-         tocReady().load(std::memory_order_acquire) ||
+  return openReady().load(std::memory_order_acquire) || tocReady().load(std::memory_order_acquire) ||
          launchInProgress().load(std::memory_order_acquire);
 }
 
@@ -258,11 +241,6 @@ inline void publishProgress(const ProgressSnapshot& p) {
   progressSlot().pendingDeliver = true;
 }
 
-// Deliver pending reader-close progress only for the active generation.
-// A reader close can race a subsequent openText/openToc; accepting an older
-// snapshot would write the previous chapter's progress into the new session.
-// clearForApp() also clears the slot, but the generation check covers the
-// narrower same-app handoff race.
 inline bool takeProgress(ProgressSnapshot& out, uint32_t expectGeneration = 0) {
   std::lock_guard<std::mutex> lock(mu());
   if (!progressSlot().pendingDeliver) return false;
@@ -281,8 +259,6 @@ inline bool takeProgress(ProgressSnapshot& out, uint32_t expectGeneration = 0) {
   return true;
 }
 
-inline uint32_t currentGeneration() {
-  return generation().load(std::memory_order_relaxed);
-}
+inline uint32_t currentGeneration() { return generation().load(std::memory_order_relaxed); }
 
 }  // namespace M4PluginReaderSession

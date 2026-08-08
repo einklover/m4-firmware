@@ -1,7 +1,16 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
+
+enum class M4xRuntimeKind {
+  Lua = 0,
+  Native = 1,
+};
+
+const char* M4xRuntimeKey(M4xRuntimeKind runtime);
+bool M4xParseRuntimeKind(const std::string& value, M4xRuntimeKind& out);
 
 // Parsed install-package manifest (manifest.json inside .m4x).
 struct M4xManifest {
@@ -11,11 +20,16 @@ struct M4xManifest {
   int versionCode = 0;      // integer for upgrade compare
   std::string minFirmware;  // optional
   std::string author;
-  std::string entry = "main.lua";
+  M4xRuntimeKind runtime = M4xRuntimeKind::Lua;
+  // Runtime entry. Lua defaults to main.lua; native apps default to main.xml.
+  std::string entry;
+  // Optional built-in native provider adapter id (fanqie/weread/jjwxc/...).
+  // It is a capability binding, never executable package code.
+  std::string provider;
   std::string icon;  // relative path inside package
   std::string description;
   std::vector<std::string> permissions;
-  // Explicit extra package files the installer may extract (sys.load modules, assets).
+  // Explicit extra package files the installer may extract (assets/config).
   // Always extracted in addition: manifest.json, entry, optional icon.
   std::vector<std::string> files;
 

@@ -3,6 +3,7 @@
 #include <HardwareSerial.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <new>
 
@@ -70,6 +71,60 @@ void* ttfAlloc(size_t n) {
 
 void ttfFree(void* p) { free(p); }
 
+// TrueType's hhea/head vertical metrics are not visually comparable across
+// families. Some CJK fonts put rare accents/symbols near head.yMax, while the
+// normal ideograph box sits much lower. GfxRenderer treats EpdFontData::ascender
+// as the distance from the requested top-left y to the baseline; therefore
+// feeding head.yMax into ascender shifts ordinary text downward and also makes
+// UI scale calculations shrink the selected TTF too aggressively.
+//
+// Pick one representative glyph once at face initialization and use its actual
+// raster-space box as the visual baseline reference. The preference order uses
+// square/common CJK ideographs first, then Latin capitals for non-CJK fonts.
+struct VisualReference {
+  bool valid = false;
+  uint32_t cp = 0;
+  int topPx = 0;     // baseline -> visible top, positive
+  int bottomPx = 0;  // baseline -> visible bottom, positive/downward
+};
+
+VisualReference findVisualReference(const ttf::TtfFont& font, uint16_t sizePx) {
+  static constexpr uint32_t kSamples[] = {
+      0x56FD,  // 国: outer square gives a stable CJK em-box sample
+      0x7530,  // 田
+      0x4E2D,  // 中
+      0x6C38,  // 永
+      0x4E00,  // 一
+      'H',
+      'M',
+  };
+
+  for (uint32_t cp : kSamples) {
+    uint16_t gid = 0;
+    if (!font.findGlyph(cp, gid) || gid == 0) continue;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (!font.glyphPixelBox(gid, sizePx, x0, y0, x1, y1)) continue;
+    const int top = std::max(0, -y0);
+    const int bottom = std::max(0, y1);
+    const int height = top + bottom;
+    // Reject pathological/empty samples. A useful reference should occupy at
+    // least half of the nominal em but must still fit EpdGlyph's 8-bit box.
+    if (height < std::max(2, static_cast<int>(sizePx) / 2) || height > 255) continue;
+    VisualReference ref;
+    ref.valid = true;
+    ref.cp = cp;
+    ref.topPx = top;
+    ref.bottomPx = bottom;
+    return ref;
+  }
+  return {};
+}
+
+int clampMetric(int value, int low, int high) {
+  if (low > high) std::swap(low, high);
+  return std::max(low, std::min(high, value));
+}
+
 }  // namespace
 
 void* TtfEpdFont::ttfAlloc(size_t n) { return ::ttfAlloc(n); }
@@ -101,19 +156,55 @@ bool TtfEpdFont::finishInit(const char* sourceLabel) {
     return false;
   }
 
-  // Scale metrics once; the source stays seekable for per-glyph glyf reads.
+  // Raster size still follows the requested nominal pixel size exactly. Only
+  // the logical line metrics are normalized so changing TTF family changes the
+  // glyph design, not the apparent top/baseline position of the whole UI/page.
   const float scale = static_cast<float>(sizePx_) / static_cast<float>(font_.unitsPerEm());
   int32_t asc = 0, desc = 0, gap = 0;
   font_.fontVMetrics(asc, desc, gap);
-  // GfxRenderer positions glyphs as baseline - glyph.top. hhea.ascender is
-  // only a typographic metric and can be smaller than the actual CJK outline;
-  // use head.yMax as the same actual-top correction used by fontconvert.py.
-  const int actualTopPx = static_cast<int>(std::lround(font_.fontBBoxYMax() * scale));
-  const int ascPx = std::max(static_cast<int>(std::lround(asc * scale)), actualTopPx);
-  const int descPx = static_cast<int>(std::lround(desc * scale));
-  int linePx = static_cast<int>(std::lround((asc - desc + gap) * scale));
-  if (linePx < 1) linePx = sizePx_;
-  if (linePx > 255) linePx = 255;
+  const int hheaAscPx = static_cast<int>(std::lround(asc * scale));
+  const int hheaDescPx = static_cast<int>(std::lround(desc * scale));
+  const int hheaGapPx = std::max(0, static_cast<int>(std::lround(gap * scale)));
+  const int bboxTopPx = std::max(0, static_cast<int>(std::lround(font_.fontBBoxYMax() * scale)));
+
+  const VisualReference ref = findVisualReference(font_, sizePx_);
+  const int nominal = std::max(1, static_cast<int>(sizePx_));
+
+  int ascPx = hheaAscPx;
+  if (ref.valid) {
+    // The representative outline is the baseline anchor. Keep only generous
+    // sanity bounds; do not force every typeface to an identical CJK drawing.
+    // This removes extreme head/hhea metrics while preserving deliberate style.
+    ascPx = clampMetric(ref.topPx,
+                        std::max(1, static_cast<int>(std::lround(nominal * 0.55f))),
+                        std::max(1, static_cast<int>(std::lround(nominal * 1.10f))));
+  } else {
+    // Non-CJK/pathological fallback: hhea is still preferable to head.yMax, but
+    // bound it around the nominal em so an exotic font cannot move all text.
+    ascPx = clampMetric(hheaAscPx,
+                        std::max(1, static_cast<int>(std::lround(nominal * 0.60f))),
+                        std::max(1, static_cast<int>(std::lround(nominal * 1.10f))));
+  }
+
+  // Preserve descender room for Latin punctuation/g/p/y, but cap extreme font
+  // metrics. The representative CJK bottom may be zero and is not sufficient
+  // on its own for mixed Chinese/Latin text.
+  int descMag = std::max(0, -hheaDescPx);
+  if (ref.valid) descMag = std::max(descMag, ref.bottomPx);
+  descMag = clampMetric(descMag, 0,
+                        std::max(1, static_cast<int>(std::lround(nominal * 0.30f))));
+  const int descPx = -descMag;
+
+  // Line spacing is a layout metric, not a license for a font to request a
+  // huge box. Keep the font's positive lineGap when reasonable and otherwise
+  // normalize to a compact reader-friendly band around the requested size.
+  const int gapPx = std::min(hheaGapPx,
+                             std::max(0, static_cast<int>(std::lround(nominal * 0.25f))));
+  int linePx = ascPx + descMag + gapPx;
+  linePx = std::max(linePx, nominal);
+  linePx = std::min(linePx,
+                    std::max(nominal, static_cast<int>(std::lround(nominal * 1.35f))));
+  linePx = std::max(1, std::min(255, linePx));
 
   data_.bitmap = nullptr;
   data_.glyph = nullptr;
@@ -125,10 +216,13 @@ bool TtfEpdFont::finishInit(const char* sourceLabel) {
   data_.is2Bit = true;
 
   valid_ = true;
-  Serial.printf("[TTF] Loaded %s @%upx (unitsPerEm=%u lineH=%u asc=%d desc=%d slots=%u meta=%u budget=%u)\n",
-                sourceLabel ? sourceLabel : "?", sizePx_, font_.unitsPerEm(), data_.advanceY, data_.ascender,
-                data_.descender, static_cast<unsigned>(maxSlots_),
-                static_cast<unsigned>(sizeof(Entry) * maxSlots_), static_cast<unsigned>(cacheBudget_));
+  Serial.printf(
+      "[TTF] Loaded %s @%upx (unitsPerEm=%u lineH=%u asc=%d desc=%d rawAsc=%d rawDesc=%d bboxTop=%d ref=U+%04X refTop=%d refBottom=%d slots=%u meta=%u budget=%u)\n",
+      sourceLabel ? sourceLabel : "?", sizePx_, font_.unitsPerEm(), data_.advanceY, data_.ascender,
+      data_.descender, hheaAscPx, hheaDescPx, bboxTopPx,
+      static_cast<unsigned>(ref.valid ? ref.cp : 0), ref.topPx, ref.bottomPx,
+      static_cast<unsigned>(maxSlots_), static_cast<unsigned>(sizeof(Entry) * maxSlots_),
+      static_cast<unsigned>(cacheBudget_));
   return true;
 }
 

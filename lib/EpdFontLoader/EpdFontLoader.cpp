@@ -251,7 +251,7 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
     activeRuntimeTtfSize = -1;
     logFontHeap("after_release");
   } else {
-    Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx (UI scales this same cache)\n",
+    Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx\n",
                   d.loadCustomFamily.c_str(), runtimeReaderSize);
   }
 
@@ -357,5 +357,11 @@ int EpdFontLoader::getBestFontId(const char* familyName, int size) {
   for (int loadedId : loadedCustomIds) {
     if (loadedId == id) return id;
   }
+#ifdef CROSSPOINT_MURPHY_M4
+  // The active runtime face is the source of truth. Bookkeeping is rebuilt on
+  // every SD/font refresh, but a successfully retained TTF face and renderer
+  // mapping must never silently degrade to the compact OMIT_FONTS fallback.
+  if (activeRuntimeTtfFamily == familyName && activeRuntimeTtfSize == size) return id;
+#endif
   return -1;
 }

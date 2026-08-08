@@ -1,0 +1,142 @@
+name: Native App Build
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'tests/native_app/**'
+      - 'platformio.ini'
+      - '.github/workflows/native-app-build.yml'
+  workflow_dispatch:
+
+jobs:
+  murphy-m4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Reconstruct unvendored SDK and libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fetch_tree() {
+            local url="$1"
+            local dst="$2"
+            local tarball="$3"
+            rm -rf "$dst"
+            mkdir -p "$dst"
+            curl -fL --retry 3 --retry-delay 2 "$url" -o "$tarball"
+            tar -xzf "$tarball" -C "$dst" --strip-components=1
+          }
+
+          fetch_tree \
+            https://github.com/Free-Ink/freeink-sdk/archive/refs/heads/main.tar.gz \
+            open-m4-sdk /tmp/freeink.tar.gz
+          fetch_tree \
+            https://github.com/crosspoint-reader/crosspoint-reader/archive/refs/heads/master.tar.gz \
+            /tmp/crosspoint /tmp/crosspoint.tar.gz
+
+          for p in Epub expat miniz; do
+            test -d "/tmp/crosspoint/lib/$p" || { echo "missing CrossPoint lib/$p"; exit 2; }
+          done
+          test -d /tmp/crosspoint/lib/EpdFont/builtinFonts || { echo 'missing builtinFonts'; exit 2; }
+
+          rm -rf lib/Epub lib/expat lib/miniz lib/EpdFont/builtinFonts
+          cp -a /tmp/crosspoint/lib/Epub lib/Epub
+          cp -a /tmp/crosspoint/lib/expat lib/expat
+          cp -a /tmp/crosspoint/lib/miniz lib/miniz
+          cp -a /tmp/crosspoint/lib/EpdFont/builtinFonts lib/EpdFont/builtinFonts
+
+          fetch_tree \
+            https://github.com/crosspoint-reader/crosspoint-reader/archive/c3093e3.tar.gz \
+            /tmp/cp-old /tmp/cp-old.tar.gz
+          test -d /tmp/cp-old/lib/picojpeg || { echo 'missing historical picojpeg'; exit 2; }
+          rm -rf lib/picojpeg
+          cp -a /tmp/cp-old/lib/picojpeg lib/picojpeg
+
+          curl -fL --retry 3 --retry-delay 2 https://www.lua.org/ftp/lua-5.4.8.tar.gz -o /tmp/lua.tar.gz
+          tar -xzf /tmp/lua.tar.gz -C /tmp
+          rm -rf lib/Lua
+          mkdir -p lib/Lua
+          cp -a /tmp/lua-5.4.8/src/. lib/Lua/
+          cat > lib/Lua/library.json <<'JSON'
+          {
+            "name": "Lua",
+            "version": "5.4.8",
+            "build": {
+              "srcFilter": "+<*> -<lua.c> -<luac.c>"
+            }
+          }
+          JSON
+
+          for p in \
+            open-m4-sdk/libs/hardware/BatteryMonitor/library.json \
+            lib/Epub/Epub.h \
+            lib/Lua/lua.h \
+            lib/expat/expat.h \
+            lib/miniz/src/MinizConfig.h \
+            lib/miniz/third_party/miniz.h \
+            lib/picojpeg/picojpeg.h \
+            lib/EpdFont/builtinFonts/all.h; do
+            test -f "$p" || { echo "missing reconstructed dependency: $p"; exit 2; }
+          done
+
+      - name: Install PlatformIO
+        run: python -m pip install --disable-pip-version-check platformio==6.1.18
+
+      - name: Build Murphy M4
+        shell: bash
+        run: |
+          set +e
+          pio run -e murphy_m4 > /tmp/m4-build.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo '=== compiler diagnostics ==='
+            grep -nE '(^|: )(fatal error:|error:|undefined reference|collect2:)' /tmp/m4-build.log | tail -n 120 || true
+            echo '=== build tail ==='
+            tail -n 160 /tmp/m4-build.log
+            exit "$rc"
+          fi
+          tail -n 40 /tmp/m4-build.log
+
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Compile native UI contract tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -Isrc \
+            tests/native_app/test_native_ui.cpp \
+            src/apps/native/M4NativeUi.cpp \
+            -o /tmp/test_native_ui
+          /tmp/test_native_ui
+
+      - name: Run existing host tests when available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -x tests/run_tests.sh ]; then
+            tests/run_tests.sh
+          elif [ -x test/run_tests.sh ]; then
+            test/run_tests.sh
+          else
+            echo 'No aggregate legacy host-test runner found.'
+          fi

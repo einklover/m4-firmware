@@ -62,6 +62,7 @@
 #include "debug/M4SerialDebugBridge.h"
 #include "apps/M4xRegistry.h"
 #include "activities/apps/AppRuntimeActivity.h"
+#include "activities/apps/NativeAppActivity.h"
 #endif
 
 #ifdef CROSSPOINT_X3
@@ -858,11 +859,18 @@ void setup() {
         // Copy app record: registry vector is temporary.
         const M4xInstalledApp launched = *app;
         exitActivity();
-        enterNewActivity(new AppRuntimeActivity(renderer, mappedInputManager, launched, []() {
-          // Return to safe home; avoid dangling activity pointers.
-          gDebugActiveAppId.clear();
-          onGoHome();
-        }));
+        if (launched.runtime == M4xRuntimeKind::Native) {
+          enterNewActivity(new NativeAppActivity(renderer, mappedInputManager, launched, []() {
+            gDebugActiveAppId.clear();
+            onGoHome();
+          }));
+        } else {
+          enterNewActivity(new AppRuntimeActivity(renderer, mappedInputManager, launched, []() {
+            // Return to safe home; avoid dangling activity pointers.
+            gDebugActiveAppId.clear();
+            onGoHome();
+          }));
+        }
         gDebugActiveAppId = appId;
         return true;
       };
