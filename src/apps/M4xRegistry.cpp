@@ -70,7 +70,11 @@ bool parseRegistry(const std::string& raw, std::vector<M4xInstalledApp>& apps) {
     a.version = o["version"] | "";
     a.versionCode = o["versionCode"] | 0;
     a.path = o["path"] | "";
-    a.entry = o["entry"] | "main.lua";
+    const std::string runtimeText = o["runtime"] | "lua";
+    if (!M4xParseRuntimeKind(runtimeText, a.runtime)) a.runtime = M4xRuntimeKind::Lua;
+    a.entry = o["entry"] | "";
+    if (a.entry.empty()) a.entry = a.runtime == M4xRuntimeKind::Native ? "main.xml" : "main.lua";
+    a.provider = o["provider"] | "";
     a.icon = o["icon"] | "";
     a.installedAt = o["installedAt"] | 0;
     if (o["permissions"].is<JsonArray>()) {
@@ -93,16 +97,12 @@ bool parseRegistry(const std::string& raw, std::vector<M4xInstalledApp>& apps) {
 std::vector<M4xInstalledApp> M4xRegistry::load() {
   std::vector<M4xInstalledApp> apps;
 
-  // Prefer primary; on corrupt/missing fall back to .bak (interrupted write recovery).
   const std::string primary = readAllText(M4xPaths::kRegistryPath);
   if (parseRegistry(primary, apps)) return apps;
 
   const std::string bak = readAllText(kRegistryBak);
   if (parseRegistry(bak, apps)) {
-    // Best-effort restore primary from bak so next boot is clean.
-    if (!bak.empty()) {
-      writeAllTextExact(M4xPaths::kRegistryPath, bak);
-    }
+    if (!bak.empty()) writeAllTextExact(M4xPaths::kRegistryPath, bak);
     return apps;
   }
 
@@ -120,7 +120,9 @@ bool M4xRegistry::save(const std::vector<M4xInstalledApp>& apps) {
     o["version"] = a.version;
     o["versionCode"] = a.versionCode;
     o["path"] = a.path;
+    o["runtime"] = M4xRuntimeKey(a.runtime);
     o["entry"] = a.entry;
+    o["provider"] = a.provider;
     o["icon"] = a.icon;
     o["installedAt"] = a.installedAt;
     JsonArray perms = o["permissions"].to<JsonArray>();
@@ -133,13 +135,10 @@ bool M4xRegistry::save(const std::vector<M4xInstalledApp>& apps) {
 
   SdMan.mkdir("/system", true);
 
-  // Write temp first.
   if (!writeAllTextExact(kRegistryTmp, out)) return false;
 
-  // Keep previous primary as bak (for recovery if rename/power-loss mid-switch).
   if (SdMan.exists(M4xPaths::kRegistryPath)) {
     if (SdMan.exists(kRegistryBak)) SdMan.remove(kRegistryBak);
-    // Prefer rename; if rename fails, copy-then-replace is still better than lose both.
     if (!SdMan.rename(M4xPaths::kRegistryPath, kRegistryBak)) {
       const std::string prev = readAllText(M4xPaths::kRegistryPath);
       if (!prev.empty()) writeAllTextExact(kRegistryBak, prev);
@@ -148,12 +147,8 @@ bool M4xRegistry::save(const std::vector<M4xInstalledApp>& apps) {
   }
 
   if (!SdMan.rename(kRegistryTmp, M4xPaths::kRegistryPath)) {
-    // Fallback: write primary from tmp contents if rename of tmp unsupported.
     if (!writeAllTextExact(M4xPaths::kRegistryPath, out)) {
-      // Try restore bak.
-      if (SdMan.exists(kRegistryBak)) {
-        SdMan.rename(kRegistryBak, M4xPaths::kRegistryPath);
-      }
+      if (SdMan.exists(kRegistryBak)) SdMan.rename(kRegistryBak, M4xPaths::kRegistryPath);
       return false;
     }
     SdMan.remove(kRegistryTmp);
@@ -170,10 +165,9 @@ const M4xInstalledApp* M4xRegistry::find(const std::vector<M4xInstalledApp>& app
 
 void M4xRegistry::upsert(std::vector<M4xInstalledApp>& apps, const M4xManifest& m, const std::string& installPath,
                          uint32_t installedAt) {
-  // Full inventory for uninstall/upgrade cleanup.
   std::vector<std::string> inv;
   inv.push_back("manifest.json");
-  inv.push_back(m.entry.empty() ? "main.lua" : m.entry);
+  inv.push_back(m.entry.empty() ? (m.runtime == M4xRuntimeKind::Native ? "main.xml" : "main.lua") : m.entry);
   if (!m.icon.empty()) inv.push_back(m.icon);
   for (const auto& f : m.files) inv.push_back(f);
 
@@ -183,7 +177,9 @@ void M4xRegistry::upsert(std::vector<M4xInstalledApp>& apps, const M4xManifest& 
       a.version = m.version;
       a.versionCode = m.versionCode;
       a.path = installPath;
+      a.runtime = m.runtime;
       a.entry = m.entry;
+      a.provider = m.provider;
       a.icon = m.icon;
       a.permissions = m.permissions;
       a.files = inv;
@@ -197,7 +193,9 @@ void M4xRegistry::upsert(std::vector<M4xInstalledApp>& apps, const M4xManifest& 
   a.version = m.version;
   a.versionCode = m.versionCode;
   a.path = installPath;
+  a.runtime = m.runtime;
   a.entry = m.entry;
+  a.provider = m.provider;
   a.icon = m.icon;
   a.permissions = m.permissions;
   a.files = inv;
