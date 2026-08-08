@@ -6,6 +6,22 @@
 #include <cctype>
 #include <cstring>
 
+const char* M4xRuntimeKey(M4xRuntimeKind runtime) {
+  return runtime == M4xRuntimeKind::Native ? "native" : "lua";
+}
+
+bool M4xParseRuntimeKind(const std::string& value, M4xRuntimeKind& out) {
+  if (value.empty() || value == "lua") {
+    out = M4xRuntimeKind::Lua;
+    return true;
+  }
+  if (value == "native") {
+    out = M4xRuntimeKind::Native;
+    return true;
+  }
+  return false;
+}
+
 bool M4xIsValidPackageId(const std::string& id) {
   if (id.size() < 3 || id.size() > 64) return false;
   bool hasDot = false;
@@ -54,7 +70,14 @@ M4xManifest M4xParseManifest(const char* json, size_t len) {
   m.versionCode = doc["versionCode"] | 0;
   m.minFirmware = doc["minFirmware"] | "";
   m.author = doc["author"] | "";
-  m.entry = doc["entry"] | "main.lua";
+  const std::string runtimeText = doc["runtime"] | "lua";
+  if (!M4xParseRuntimeKind(runtimeText, m.runtime)) {
+    m.error = "invalid_runtime";
+    return m;
+  }
+  m.entry = doc["entry"] | "";
+  if (m.entry.empty()) m.entry = m.runtime == M4xRuntimeKind::Native ? "main.xml" : "main.lua";
+  m.provider = doc["provider"] | "";
   m.icon = doc["icon"] | "";
   m.description = doc["description"] | "";
 
@@ -81,7 +104,16 @@ M4xManifest M4xParseManifest(const char* json, size_t len) {
     m.error = "invalid_versionCode";
     return m;
   }
-  if (m.entry.empty()) m.entry = "main.lua";
+  if (m.runtime == M4xRuntimeKind::Native && m.provider.size() > 32) {
+    m.error = "invalid_provider";
+    return m;
+  }
+  for (unsigned char c : m.provider) {
+    if (!(std::isalnum(c) || c == '_' || c == '-' || c == '.')) {
+      m.error = "invalid_provider";
+      return m;
+    }
+  }
 
   // Path safety for every package-relative path the installer may write.
   {
@@ -109,7 +141,6 @@ M4xManifest M4xParseManifest(const char* json, size_t len) {
       return m;
     }
   }
-  // Ensure extract plan builds (dedupe + allow-list).
   {
     const auto plan = M4xPathSafe::makeExtractList(m.entry, m.icon, m.files);
     if (!plan.ok) {
@@ -125,7 +156,6 @@ M4xManifest M4xParseManifest(const char* json, size_t len) {
     }
   }
 
-  // Always grant core UI permissions even if omitted.
   auto ensure = [&](const char* p) {
     for (const auto& x : m.permissions) {
       if (x == p) return;
