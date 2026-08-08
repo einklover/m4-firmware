@@ -39,11 +39,25 @@ int sizeForEnum(uint8_t fontSizeEnum) {
   }
 }
 
+bool isRuntimeTtfFamily(const std::string& familyName) {
+  if (familyName.size() < 4) return false;
+  std::string suffix = familyName.substr(familyName.size() - 4);
+  std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return suffix == ".ttf";
+}
+
+// Runtime TTFs are expensive faces (stream + cmap + cache metadata). Reuse the
+// exact current reader face across settings/layout reloads instead of recreating
+// it whenever orientation or a non-font setting invalidates pagination.
+std::string activeRuntimeTtfFamily;
+int activeRuntimeTtfSize = -1;
+
 bool insertCustomFamily(GfxRenderer& renderer, const char* familyName, int size) {
   EpdFontFamily* family = FontManager::getInstance().getCustomFontFamily(familyName, size);
   if (!family) {
-    Serial.printf("[FontLoader] Failed to load '%s' size %d from /fonts/%s.epdfont\n", familyName, size,
-                  familyName);
+    Serial.printf("[FontLoader] Failed to load '%s' size %d\n", familyName, size);
     return false;
   }
   const int id = hashFontId(familyName, size);
@@ -85,9 +99,9 @@ void EpdFontLoader::ensureFontsFromSd(GfxRenderer& renderer) {
 }
 
 void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
+  const std::vector<int> previousCustomIds = loadedCustomIds;
   loadedCustomIds.clear();
   lastCanonicalResult = M4FontPolicy::LoadResult::NotAttempted;
-  FontManager::getInstance().clearLoadedFonts();
   FontManager::getInstance().invalidateScan();
   const auto& families = FontManager::getInstance().getAvailableFamilies();
 
@@ -113,27 +127,70 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
     lastCanonicalResult = M4FontPolicy::LoadResult::Missing;
   }
 
-  // 1) Explicit CUSTOM family → reader hash IDs only (no UI promotion unless canonical).
-  if (!d.loadCustomFamily.empty()) {
-    std::vector<int> sizes = {12, 14, 16, 18, 20, 24};
-    // Runtime TTF: honor the exact customFontSize (12..48) so the reader's
-    // getReaderFontId() customFontSize branch resolves to a loaded id.
-    const uint8_t explicitSize = SETTINGS.customFontSize == 0
-                                     ? 0
-                                     : std::max<uint8_t>(12, std::min<uint8_t>(48, SETTINGS.customFontSize));
-    if (explicitSize != 0 && std::find(sizes.begin(), sizes.end(), explicitSize) == sizes.end()) {
-      sizes.push_back(explicitSize);
+  const bool runtimeTtf = !d.loadCustomFamily.empty() && isRuntimeTtfFamily(d.loadCustomFamily);
+  int runtimeReaderSize = -1;
+  bool reuseRuntimeTtf = false;
+  if (runtimeTtf) {
+    runtimeReaderSize = SETTINGS.customFontSize == 0
+                            ? sizeForEnum(SETTINGS.fontSize)
+                            : std::max<int>(12, std::min<int>(48, SETTINGS.customFontSize));
+    const int runtimeId = hashFontId(d.loadCustomFamily.c_str(), runtimeReaderSize);
+    reuseRuntimeTtf = activeRuntimeTtfFamily == d.loadCustomFamily && activeRuntimeTtfSize == runtimeReaderSize &&
+                      renderer.hasFont(runtimeId);
+  }
+
+  if (!reuseRuntimeTtf) {
+    // Old custom mappings are value-copies of families containing raw EpdFont
+    // pointers. Drop the renderer aliases before FontManager forgets/reloads
+    // them so a newly selected family/size cannot be shadowed by insert-only IDs.
+    for (int id : previousCustomIds) renderer.removeFont(id);
+    FontManager::getInstance().clearLoadedFonts();
+    if (!runtimeTtf) {
+      activeRuntimeTtfFamily.clear();
+      activeRuntimeTtfSize = -1;
     }
+  } else {
+    Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx (UI scales this same cache)\n",
+                  d.loadCustomFamily.c_str(), runtimeReaderSize);
+  }
+
+  // 1) Explicit CUSTOM family → reader hash IDs. Runtime TTF is deliberately
+  // ONE rasterizer face: the reader size. UI/status chrome resolves this same
+  // face and uses GfxRenderer's bitmap scaling, so 12/14/16/18/20/24 no longer
+  // allocate independent cmap/cache/mutex/stream state.
+  if (!d.loadCustomFamily.empty()) {
+    std::vector<int> sizes;
+    if (runtimeTtf) {
+      sizes.push_back(runtimeReaderSize);
+    } else {
+      // Preserve legacy epdfont behavior; its fixed bitmap artifact is cheap
+      // compared with the runtime TTF rasterizer and existing IDs depend on it.
+      sizes = {12, 14, 16, 18, 20, 24};
+      const uint8_t explicitSize = SETTINGS.customFontSize == 0
+                                       ? 0
+                                       : std::max<uint8_t>(12, std::min<uint8_t>(48, SETTINGS.customFontSize));
+      if (explicitSize != 0 && std::find(sizes.begin(), sizes.end(), explicitSize) == sizes.end()) {
+        sizes.push_back(explicitSize);
+      }
+    }
+
     bool any = false;
     for (int sz : sizes) {
       any = (loadAndInsertCustom(renderer, d.loadCustomFamily.c_str(), sz, loadedCustomIds) >= 0) || any;
     }
     if (!any) {
       Serial.printf("[M4-FONT] DIAG: failed to load explicit custom '%s'\n", d.loadCustomFamily.c_str());
+      if (runtimeTtf) {
+        activeRuntimeTtfFamily.clear();
+        activeRuntimeTtfSize = -1;
+      }
+    } else if (runtimeTtf) {
+      activeRuntimeTtfFamily = d.loadCustomFamily;
+      activeRuntimeTtfSize = runtimeReaderSize;
+      Serial.printf("[M4-FONT] Runtime TTF single-face mode '%s' reader=%dpx; UI/status reuse + scale\n",
+                    d.loadCustomFamily.c_str(), runtimeReaderSize);
     } else {
-      Serial.printf("[M4-FONT] Loaded explicit CUSTOM family '%s' for reader (not auto-promoted to UI "
-                    "unless it is the canonical file)\n",
-                    d.loadCustomFamily.c_str());
+      Serial.printf("[M4-FONT] Loaded explicit CUSTOM family '%s' for reader\n", d.loadCustomFamily.c_str());
     }
   }
 
@@ -161,7 +218,9 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
   return;
 #endif
 
-  // Non-M4: original behavior — load only when FONT_CUSTOM is set.
+  // Non-M4: original behavior — reload only the selected custom face.
+  for (int id : previousCustomIds) renderer.removeFont(id);
+  FontManager::getInstance().clearLoadedFonts();
   if (SETTINGS.fontFamily == CrossPointSettings::FONT_CUSTOM) {
     if (strlen(SETTINGS.customFontFamily) > 0) {
       Serial.printf("Loading custom font: %s size %d\n", SETTINGS.customFontFamily, SETTINGS.fontSize);
