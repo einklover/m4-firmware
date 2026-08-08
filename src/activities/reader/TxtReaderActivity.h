@@ -13,6 +13,7 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderMenuActivity.h"
 #include "activities/ActivityWithSubactivity.h"
+#include "apps/M4PluginReaderSession.h"
 #include "util/M4ContentProviderContract.h"
 
 class TxtReaderActivity final : public ActivityWithSubactivity {
@@ -129,7 +130,7 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   // maxReadBytes: exclusive read-window size from offset (0 = default CHUNK_SIZE 8KiB).
   // First-page adaptive path passes growing 8/16/.../48KiB so expansion is real, not a re-read of 8KiB.
   // outJustify: if non-null, write per-line justify flags there; if null, write currentPageJustify.
-  // Index builders MUST pass a scratch vector so progressive index does not clobber the
+  // Index builders MUST pass a scratch vector so progressive indexing does not clobber the
   // on-screen page's justify flags (causes mid-read left/justify flicker).
   bool loadPageAtOffset(size_t offset, size_t endoffset, std::vector<std::string>& outLines, size_t& nextOffset,
                         const uint8_t* preloadBuf = nullptr, size_t preloadBufOffset = 0, size_t preloadBufSize = 0,
@@ -197,9 +198,38 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
 
   // --- Plugin session ---
   PluginSession pluginSession_{};
-  bool pluginCloseRequested_ = false;
   // Set when plugin TOC selects another chapter; published in pluginProgressSnapshot.
   int pluginSwitchChapterIndex_ = -1;
+
+  // bool-like close flag with one narrowly scoped side effect: if the provider
+  // bridge has converted an empty-path next-chapter open into a list-style
+  // fallback intent, the first requestPluginClose() copies that chapter index
+  // into the existing reader progress field and schedules the normal onGoBack
+  // callback. Thus automatic chapter-end fallback follows exactly the same
+  // tested close → Lua loading page → download → reopen path as manual TOC.
+  struct PluginCloseFlag {
+    bool value = false;
+    bool* pendingGoBack = nullptr;
+    int* switchChapterIndex = nullptr;
+
+    PluginCloseFlag(bool* goBack, int* switchIndex)
+        : value(false), pendingGoBack(goBack), switchChapterIndex(switchIndex) {}
+
+    PluginCloseFlag& operator=(bool v) {
+      value = v;
+      if (v && pendingGoBack && switchChapterIndex && *switchChapterIndex < 0) {
+        const int fallback = M4PluginReaderSession::pendingFallbackSwitchChapterIndex();
+        if (fallback >= 0) {
+          *switchChapterIndex = fallback;
+          *pendingGoBack = true;
+        }
+      }
+      return *this;
+    }
+    operator bool() const { return value; }
+  };
+  PluginCloseFlag pluginCloseRequested_{&pendingGoBack, &pluginSwitchChapterIndex_};
+
   bool firstPageReady_ = false;
   bool indexComplete_ = true;
   size_t indexRangeEnd_ = 0;   // exclusive file end for progressive index

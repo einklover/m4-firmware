@@ -26,6 +26,33 @@ class FontManager {
   // 清除已加载字体的内存缓存（切换字体时调用，迫使重新加载并写入 flash）
   void clearLoadedFonts();
 
+  // Runtime TTF objects own their stream/cmap/scratch/PSRAM cache metadata.
+  // Once GfxRenderer aliases have been removed, they can and should be fully
+  // destroyed on a real family/reader-size switch. The legacy clear path only
+  // clears caches because historical epdfont objects have mixed ownership;
+  // keeping this operation TTF-only avoids changing that legacy contract.
+  void releaseRuntimeTtfFaces() {
+    for (auto familyIt = loadedFonts.begin(); familyIt != loadedFonts.end();) {
+      auto& sizes = familyIt->second;
+      for (auto sizeIt = sizes.begin(); sizeIt != sizes.end();) {
+        EpdFontFamily* family = sizeIt->second;
+        const EpdFont* font = family ? family->getFont(EpdFontFamily::REGULAR) : nullptr;
+        if (font && font->isRuntimeTtf()) {
+          delete const_cast<EpdFont*>(font);
+          delete family;
+          sizeIt = sizes.erase(sizeIt);
+        } else {
+          ++sizeIt;
+        }
+      }
+      if (sizes.empty()) {
+        familyIt = loadedFonts.erase(familyIt);
+      } else {
+        ++familyIt;
+      }
+    }
+  }
+
   // Force next getAvailableFamilies() to re-scan /fonts and /FONT (M4 hot-plug / first boot).
   void invalidateScan() {
     scanned = false;
