@@ -2,6 +2,7 @@
 
 #include "apps/M4xJsonStream.h"
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
