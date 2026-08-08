@@ -251,8 +251,14 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
     activeRuntimeTtfSize = -1;
     logFontHeap("after_release");
   } else {
-    Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx (UI scales this same cache)\n",
-                  d.loadCustomFamily.c_str(), runtimeReaderSize);
+    // loadFontsFromSd() clears loadedCustomIds before deciding whether the
+    // expensive TTF face can be reused. Re-register the still-live renderer
+    // mapping so getBestFontId()/getReaderFontId() keep returning the TTF hash
+    // ID instead of silently falling back to the OMIT_FONTS builtin CJK subset.
+    const int runtimeId = hashFontId(d.loadCustomFamily.c_str(), runtimeReaderSize);
+    loadedCustomIds.push_back(runtimeId);
+    Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx id=%d (registration retained)\n",
+                  d.loadCustomFamily.c_str(), runtimeReaderSize, runtimeId);
   }
 
   // 1) Explicit CUSTOM family → reader hash IDs. Runtime TTF is deliberately
