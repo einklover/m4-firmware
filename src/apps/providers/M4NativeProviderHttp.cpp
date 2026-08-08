@@ -1,4 +1,5 @@
 #include "apps/providers/M4NativeProviderHttp.h"
+#include "apps/providers/M4NativeWifi.h"
 
 #include <Arduino.h>
 #include <HTTPClient.h>
@@ -91,7 +92,6 @@ void applyHeaders(HTTPClient& http, const std::vector<Header>& headers) {
     if (low == "accept-encoding") hasAe = true;
   }
   if (!hasUa) http.addHeader("User-Agent", "Murphy-M4/NativeProvider/1");
-  // HTTPClient's transfer decoder handles chunked framing, not gzip payloads.
   if (!hasAe) http.addHeader("Accept-Encoding", "identity");
 }
 
@@ -102,13 +102,16 @@ Result perform(const Request& req, M4xJsonStream::Sink& sink,
     out.error = "bad_request";
     return out;
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    out.error = "wifi_not_connected";
-    return out;
-  }
   if (cancelled && cancelled()) {
     out.error = "cancelled";
     return out;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    const auto wifi = M4NativeWifi::ensureConnected(std::min<uint32_t>(req.timeoutMs, 20000), cancelled);
+    if (!wifi.ok) {
+      out.error = wifi.error.empty() ? "wifi_not_connected" : wifi.error;
+      return out;
+    }
   }
 
   HTTPClient http;
