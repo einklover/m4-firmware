@@ -27,12 +27,16 @@ enum class ActionKind {
   Repaint,
   Navigate,
   Close,
+  OpenProviderBook,
+  OpenProviderToc,
+  OpenLogin,
   Error,
 };
 
 struct ActionResult {
   ActionKind kind = ActionKind::None;
   std::string screenId;
+  std::string payload;  // route payload, e.g. m4cp://provider/book
   std::string error;
 
   static ActionResult repaint() {
@@ -49,6 +53,12 @@ struct ActionResult {
   static ActionResult close() {
     ActionResult r;
     r.kind = ActionKind::Close;
+    return r;
+  }
+  static ActionResult openProviderBook(std::string uri) {
+    ActionResult r;
+    r.kind = ActionKind::OpenProviderBook;
+    r.payload = std::move(uri);
     return r;
   }
 };
