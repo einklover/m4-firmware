@@ -25,29 +25,35 @@ namespace {
 class DirectFileSink final : public M4xJsonStream::Sink {
  public:
   ~DirectFileSink() override { close(); }
+
   bool open(const std::string& path) {
     close();
     path_ = path;
     M4NativeProviderIo::ensureParentDirs(path_);
     if (SdMan.exists(path_.c_str())) SdMan.remove(path_.c_str());
     open_ = SdMan.openFileForWrite("WR-TMP", path_.c_str(), f_);
+    bytes_ = 0;
     return open_;
   }
+
   bool write(const uint8_t* data, size_t len) override {
     if (!open_ || !data) return false;
     if (len == 0) return true;
-    const int n = f_.write(data, len);
-    if (n != static_cast<int>(len)) return false;
+    const size_t n = f_.write(data, len);
+    if (n != len) return false;
     bytes_ += len;
     return true;
   }
+
   void close() {
     if (open_) {
       f_.close();
       open_ = false;
     }
   }
+
   size_t bytes() const { return bytes_; }
+
  private:
   FsFile f_;
   std::string path_;
@@ -58,14 +64,18 @@ class DirectFileSink final : public M4xJsonStream::Sink {
 class PsvtsSink final : public M4xJsonStream::Sink {
  public:
   PsvtsSink() { scanner_.reset(M4xPsvts::kMaxValueLen); }
+
   bool write(const uint8_t* data, size_t len) override {
+    if (!data || len == 0) return true;
+    if (scanned_ > M4xPsvts::kMaxScanBytes || len > M4xPsvts::kMaxScanBytes - scanned_) return false;
     scanned_ += len;
-    if (scanned_ > M4xPsvts::kMaxScanBytes) return false;
     if (!scanner_.found && !scanner_.valueTooLarge) scanner_.feed(data, len);
     return !scanner_.valueTooLarge;
   }
+
   bool found() const { return scanner_.found && !scanner_.value.empty(); }
   const std::string& value() const { return scanner_.value; }
+
  private:
   M4xPsvts::Scanner scanner_;
   size_t scanned_ = 0;
@@ -84,24 +94,25 @@ std::vector<M4NativeProviderHttp::Header> authHeaders(const std::string& cookie,
 std::string readPrefix(const std::string& path, size_t cap = 512) {
   FsFile f;
   if (!SdMan.openFileForRead("WR-PFX", path.c_str(), f)) return {};
-  const size_t n = std::min(cap, static_cast<size_t>(f.fileSize()));
+  const size_t n = std::min<size_t>(cap, static_cast<size_t>(f.fileSize()));
   std::string s;
   s.resize(n);
-  const int r = n ? f.read(reinterpret_cast<uint8_t*>(&s[0]), n) : 0;
+  const size_t got = n ? f.read(reinterpret_cast<uint8_t*>(&s[0]), n) : 0;
   f.close();
-  if (r < 0 || static_cast<size_t>(r) != n) return {};
+  if (got != n) return {};
   return s;
 }
 
 bool containsLoginTimeout(const std::string& prefix) {
-  return prefix.find("-2012") != std::string::npos || prefix.find("LOGIN_TIMEOUT") != std::string::npos;
+  return prefix.find("-2012") != std::string::npos ||
+         prefix.find("LOGIN_TIMEOUT") != std::string::npos;
 }
 
 bool fileSize(const std::string& path, size_t& n) {
   n = 0;
   FsFile f;
   if (!SdMan.openFileForRead("WR-SZ", path.c_str(), f)) return false;
-  n = f.fileSize();
+  n = static_cast<size_t>(f.fileSize());
   f.close();
   return true;
 }
@@ -119,19 +130,20 @@ bool appendCheckedShard(FsFile& combined, const std::string& shardPath, std::str
     err = "shard_open";
     return false;
   }
-  const size_t total = in.fileSize();
+  const size_t total = static_cast<size_t>(in.fileSize());
   if (total <= 32) {
     in.close();
     err = "shard_short";
     return false;
   }
+
   char expectedRaw[32];
-  if (in.read(reinterpret_cast<uint8_t*>(expectedRaw), sizeof(expectedRaw)) != 32) {
+  if (in.read(reinterpret_cast<uint8_t*>(expectedRaw), sizeof(expectedRaw)) != sizeof(expectedRaw)) {
     in.close();
     err = "shard_header";
     return false;
   }
-  std::string expected(expectedRaw, 32);
+  std::string expected(expectedRaw, sizeof(expectedRaw));
   std::transform(expected.begin(), expected.end(), expected.begin(), [](unsigned char c) {
     return static_cast<char>(std::toupper(c));
   });
@@ -144,23 +156,24 @@ bool appendCheckedShard(FsFile& combined, const std::string& shardPath, std::str
     err = "md5_init";
     return false;
   }
+
   uint8_t buf[4096];
-  size_t left = total - 32;
+  size_t left = total - sizeof(expectedRaw);
   bool ok = true;
   while (left > 0) {
-    const size_t want = std::min(left, sizeof(buf));
-    const int n = in.read(buf, want);
-    if (n <= 0) {
+    const size_t want = std::min<size_t>(left, sizeof(buf));
+    const size_t got = in.read(buf, want);
+    if (got == 0) {
       ok = false;
       break;
     }
-    mbedtls_md5_update(&ctx, buf, static_cast<size_t>(n));
-    if (combined.write(buf, static_cast<size_t>(n)) != n) {
+    if (mbedtls_md5_update(&ctx, buf, got) != 0 || combined.write(buf, got) != got) {
       ok = false;
       break;
     }
-    left -= static_cast<size_t>(n);
+    left -= got;
   }
+
   uint8_t md[16] = {};
   if (ok && mbedtls_md5_finish(&ctx, md) != 0) ok = false;
   mbedtls_md5_free(&ctx);
@@ -180,17 +193,23 @@ std::vector<int> swapPositions(const uint8_t* tail, int tailN, int length) {
   std::vector<int> result;
   if (length < 4) return result;
   if (length < 11) return {0, 2};
+
   std::string tmp;
+  tmp.reserve(static_cast<size_t>(tailN) * 5u);
   for (int i = tailN - 1; i >= 0; --i) {
     const uint8_t v = tail[i];
     uint32_t val = 0;
-    for (int b = 0; b < 8; ++b) if ((v >> b) & 1) val += (1u << (2 * b));
+    for (int b = 0; b < 8; ++b) {
+      if ((v >> b) & 1u) val += (1u << (2 * b));
+    }
     tmp += std::to_string(val);
   }
+
   const int m = length - tailN - 2;
   if (m <= 0) return result;
   const int step = static_cast<int>(std::to_string(m).size());
-  for (int i = 0; static_cast<int>(result.size()) < 10 && i + step < static_cast<int>(tmp.size()); i += step) {
+  for (int i = 0; static_cast<int>(result.size()) < 10 &&
+                  i + step < static_cast<int>(tmp.size()); i += step) {
     auto parse = [&](int at) {
       int v = 0;
       for (int k = 0; k < step && at + k < static_cast<int>(tmp.size()); ++k) {
@@ -219,13 +238,14 @@ bool reverseSwapsOnFile(const std::string& path, size_t payloadBytes, std::strin
     err = "payload_short";
     return false;
   }
-  const int length = static_cast<int>(payloadBytes - 1);  // enc starts after payload[0]
+  const int length = static_cast<int>(payloadBytes - 1);  // encoded payload starts after payload[0]
   const int n = std::min(4, (length + 9) / 10);
   FsFile f = SdMan.open(path.c_str(), O_RDWR);
   if (!f) {
     err = "swap_open";
     return false;
   }
+
   uint8_t tail[4] = {};
   for (int i = 0; i < n; ++i) {
     if (!readByteAt(f, 1u + static_cast<size_t>(length - n + i), tail[i])) {
@@ -234,13 +254,15 @@ bool reverseSwapsOnFile(const std::string& path, size_t payloadBytes, std::strin
       return false;
     }
   }
+
   const auto pos = swapPositions(tail, n, length);
   for (int i = static_cast<int>(pos.size()) - 1; i > 0; i -= 2) {
     for (int k = 1; k >= 0; --k) {
       const int l = pos[static_cast<size_t>(i)] + k;
       const int r = pos[static_cast<size_t>(i - 1)] + k;
       if (l < 0 || r < 0 || l >= length || r >= length) continue;
-      uint8_t a = 0, b = 0;
+      uint8_t a = 0;
+      uint8_t b = 0;
       if (!readByteAt(f, 1u + static_cast<size_t>(l), a) ||
           !readByteAt(f, 1u + static_cast<size_t>(r), b) ||
           !writeByteAt(f, 1u + static_cast<size_t>(l), b) ||
@@ -259,6 +281,7 @@ bool reverseSwapsOnFile(const std::string& path, size_t payloadBytes, std::strin
 class XhtmlStripSink final : public M4xJsonStream::Sink {
  public:
   explicit XhtmlStripSink(M4xJsonStream::Sink& out) : out_(out) {}
+
   bool write(const uint8_t* data, size_t len) override {
     for (size_t i = 0; i < len; ++i) {
       const uint8_t b = data[i];
@@ -268,7 +291,8 @@ class XhtmlStripSink final : public M4xJsonStream::Sink {
           std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
           });
-          if (low.find("br") == 0 || low.find("/p") == 0 || low.find("/div") == 0 || low.find("/li") == 0) {
+          if (low.find("br") == 0 || low.find("/p") == 0 ||
+              low.find("/div") == 0 || low.find("/li") == 0) {
             if (!emit('\n')) return false;
           }
           inTag_ = false;
@@ -278,13 +302,20 @@ class XhtmlStripSink final : public M4xJsonStream::Sink {
         }
         continue;
       }
+
       if (inEntity_) {
         if (b == ';') {
-          if (entity_ == "nbsp" || entity_ == "#160") { if (!emit(' ')) return false; }
-          else if (entity_ == "amp") { if (!emit('&')) return false; }
-          else if (entity_ == "lt") { if (!emit('<')) return false; }
-          else if (entity_ == "gt") { if (!emit('>')) return false; }
-          else { if (!emit(' ')) return false; }
+          if (entity_ == "nbsp" || entity_ == "#160") {
+            if (!emit(' ')) return false;
+          } else if (entity_ == "amp") {
+            if (!emit('&')) return false;
+          } else if (entity_ == "lt") {
+            if (!emit('<')) return false;
+          } else if (entity_ == "gt") {
+            if (!emit('>')) return false;
+          } else {
+            if (!emit(' ')) return false;
+          }
           inEntity_ = false;
           entity_.clear();
           continue;
@@ -293,10 +324,12 @@ class XhtmlStripSink final : public M4xJsonStream::Sink {
           entity_.push_back(static_cast<char>(b));
           continue;
         }
-        if (!emit('&') || !out_.write(reinterpret_cast<const uint8_t*>(entity_.data()), entity_.size())) return false;
+        if (!emit('&') ||
+            !out_.write(reinterpret_cast<const uint8_t*>(entity_.data()), entity_.size())) return false;
         inEntity_ = false;
         entity_.clear();
       }
+
       if (b == '<') {
         inTag_ = true;
         tag_.clear();
@@ -309,11 +342,13 @@ class XhtmlStripSink final : public M4xJsonStream::Sink {
     }
     return true;
   }
+
  private:
   bool emit(char c) {
     const uint8_t b = static_cast<uint8_t>(c);
     return out_.write(&b, 1);
   }
+
   M4xJsonStream::Sink& out_;
   bool inTag_ = false;
   bool inEntity_ = false;
@@ -348,55 +383,67 @@ bool decodeBase64File(const std::string& combinedPath, bool stripXhtml,
     if (f.isOpen()) f.close();
     return false;
   }
+
   XhtmlStripSink stripped(finalSink);
   M4xJsonStream::Sink& target = stripXhtml ? static_cast<M4xJsonStream::Sink&>(stripped)
                                            : static_cast<M4xJsonStream::Sink&>(finalSink);
-  uint8_t in[4096];
-  uint8_t out[3072 + 8];
-  size_t outN = 0;
-  int val = 0;
-  int valb = -8;
+  uint8_t input[4096];
+  uint8_t output[3072 + 8];
+  size_t outputLen = 0;
+  uint32_t acc = 0;
+  int bits = 0;
   size_t done = 1;
-  while (done < total) {
+  bool sawPadding = false;
+
+  while (done < total && !sawPadding) {
     if (cancelled && cancelled()) {
       f.close();
       err = "cancelled";
       return false;
     }
-    const size_t want = std::min(sizeof(in), total - done);
-    const int nr = f.read(in, want);
-    if (nr <= 0) break;
-    for (int i = 0; i < nr; ++i) {
-      const uint8_t c = in[i];
+    const size_t want = std::min<size_t>(sizeof(input), total - done);
+    const size_t got = f.read(input, want);
+    if (got == 0) break;
+
+    for (size_t i = 0; i < got; ++i) {
+      const uint8_t c = input[i];
       if (c == '=') {
-        done = total;
+        sawPadding = true;
         break;
       }
       const int d = b64Value(c);
-      if (d < 0) continue;
-      val = (val << 6) + d;
-      valb += 6;
-      if (valb >= 0) {
-        out[outN++] = static_cast<uint8_t>((val >> valb) & 0xFF);
-        valb -= 8;
-        if (outN >= 3072) {
-          if (!target.write(out, outN)) {
+      if (d < 0) continue;  // tolerate transport whitespace
+
+      // Keep only the live < 8 residual bits after each output byte. This
+      // avoids the signed/unbounded shift overflow in the original decoder on
+      // long chapters while remaining fully streaming.
+      acc = (acc << 6) | static_cast<uint32_t>(d);
+      bits += 6;
+      while (bits >= 8) {
+        bits -= 8;
+        output[outputLen++] = static_cast<uint8_t>((acc >> bits) & 0xFFu);
+        if (bits == 0) acc = 0;
+        else acc &= (1u << bits) - 1u;
+        if (outputLen >= 3072) {
+          if (!target.write(output, outputLen)) {
             f.close();
             err = "decode_write";
             return false;
           }
-          outN = 0;
+          outputLen = 0;
         }
       }
     }
-    if (done != total) done += static_cast<size_t>(nr);
+
+    done += got;
     if (progress) {
       const int pct = static_cast<int>((std::min(done, total) * 90u) / total);
       progress(M4NativeProvider::Phase::Decoding, total, finalSink.written(), pct);
     }
   }
   f.close();
-  if (outN && !target.write(out, outN)) {
+
+  if (outputLen && !target.write(output, outputLen)) {
     err = "decode_write";
     return false;
   }
@@ -422,7 +469,7 @@ bool combineShards(const std::vector<std::string>& shards, const std::string& co
     }
   }
   out.flush();
-  payloadBytes = out.fileSize();
+  payloadBytes = static_cast<size_t>(out.fileSize());
   out.close();
   if (payloadBytes <= 1) {
     SdMan.remove(combinedPath.c_str());
@@ -472,7 +519,9 @@ class WereadProvider final : public M4NativeProvider::Adapter {
     const std::string combined = base + ".combined";
     auto cleanup = [&]() {
       const char* paths[] = {e0.c_str(), a.c_str(), b.c_str(), combined.c_str()};
-      for (const char* p : paths) if (SdMan.exists(p)) SdMan.remove(p);
+      for (const char* p : paths) {
+        if (SdMan.exists(p)) SdMan.remove(p);
+      }
     };
     cleanup();
 
@@ -483,6 +532,7 @@ class WereadProvider final : public M4NativeProvider::Adapter {
       cleanup();
       return out;
     }
+
     const std::string pfx = readPrefix(e0);
     if (containsLoginTimeout(pfx)) {
       out.authRequired = true;
@@ -512,8 +562,7 @@ class WereadProvider final : public M4NativeProvider::Adapter {
         return out;
       }
       shards = {a, b};
-      // e0 is routing metadata for text mode, not a content shard.
-      SdMan.remove(e0.c_str());
+      SdMan.remove(e0.c_str());  // e0 is routing metadata in text mode
     } else {
       if (!downloadShard("/web/book/chapter/e_1", readerUrl, req, psvts, cookie, a,
                          progress, cancelled, out.error) ||
@@ -547,6 +596,7 @@ class WereadProvider final : public M4NativeProvider::Adapter {
       return out;
     }
     finalSink.close();
+
     size_t finalBytes = 0;
     if (!M4NativeProviderIo::commitPart(req.cacheAbsPath, &finalBytes)) {
       out.error = "cache_commit_failed";
@@ -593,6 +643,7 @@ class WereadProvider final : public M4NativeProvider::Adapter {
       err = "sd_open_failed";
       return false;
     }
+
     M4NativeProviderHttp::Request r;
     r.method = "POST";
     r.url = std::string("https://weread.qq.com") + endpoint;
@@ -601,19 +652,22 @@ class WereadProvider final : public M4NativeProvider::Adapter {
     const long rnd = static_cast<long>(esp_random() % 10000u);
     r.body = weread_crypto::makeContentParamsJson(req.book.bookId, req.chapter.uid, psvts,
                                                   false, 1, now, rnd);
-    r.maxBytes = std::max<size_t>(2u * 1024u * 1024u, req.book.cachePolicy.maxChapterBytes * 2u);
+    r.maxBytes = std::max<size_t>(2u * 1024u * 1024u,
+                                  req.book.cachePolicy.maxChapterBytes * 2u);
     r.timeoutMs = 30000;
     const auto net = M4NativeProviderHttp::requestToSink(
         r, sink,
         [&](size_t n) {
           if (progress) progress(M4NativeProvider::Phase::Receiving, n, 0, 0);
         }, cancelled);
+    const size_t shardBytes = sink.bytes();
     sink.close();
-    if (!net.ok || sink.bytes() == 0) {
+    if (!net.ok || shardBytes == 0) {
       err = (net.status == 401 || net.status == 403) ? "login_required" : net.error;
       if (err.empty()) err = "shard_download";
       return false;
     }
+
     const std::string prefix = readPrefix(outPath, 256);
     if (containsLoginTimeout(prefix)) {
       err = "login_required";
