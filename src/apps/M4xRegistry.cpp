@@ -18,6 +18,10 @@ std::string readAllText(const char* path) {
   FsFile f;
   if (!SdMan.openFileForRead("M4xReg", path, f)) return {};
   const size_t n = f.fileSize();
+  if (n > 256u * 1024u) {
+    f.close();
+    return {};
+  }
   std::string out;
   out.resize(n);
   if (n > 0) {
@@ -54,6 +58,24 @@ bool writeAllTextExact(const char* path, const std::string& body) {
   }
   f.close();
   return true;
+}
+
+// During crash recovery the install journal intentionally carries only the
+// minimal old schema. Re-read the live manifest so a native package cannot be
+// reconstructed as Lua merely because runtime/provider were introduced after
+// that journal format. The live tree has already been promoted at this point.
+void applyLiveManifestRuntime(const std::string& installPath, M4xRuntimeKind& runtime,
+                              std::string& entry, std::string& provider) {
+  std::string p = installPath;
+  if (!p.empty() && p.back() != '/') p += '/';
+  p += M4xPaths::kManifestName;
+  const std::string raw = readAllText(p.c_str());
+  if (raw.empty() || raw.size() > 32u * 1024u) return;
+  const M4xManifest live = M4xParseManifest(raw.data(), raw.size());
+  if (!live.valid) return;
+  runtime = live.runtime;
+  entry = live.entry;
+  provider = live.provider;
 }
 
 bool parseRegistry(const std::string& raw, std::vector<M4xInstalledApp>& apps) {
@@ -165,9 +187,15 @@ const M4xInstalledApp* M4xRegistry::find(const std::vector<M4xInstalledApp>& app
 
 void M4xRegistry::upsert(std::vector<M4xInstalledApp>& apps, const M4xManifest& m, const std::string& installPath,
                          uint32_t installedAt) {
+  M4xRuntimeKind runtime = m.runtime;
+  std::string entry = m.entry;
+  std::string provider = m.provider;
+  applyLiveManifestRuntime(installPath, runtime, entry, provider);
+  if (entry.empty()) entry = runtime == M4xRuntimeKind::Native ? "main.xml" : "main.lua";
+
   std::vector<std::string> inv;
   inv.push_back("manifest.json");
-  inv.push_back(m.entry.empty() ? (m.runtime == M4xRuntimeKind::Native ? "main.xml" : "main.lua") : m.entry);
+  inv.push_back(entry);
   if (!m.icon.empty()) inv.push_back(m.icon);
   for (const auto& f : m.files) inv.push_back(f);
 
@@ -177,9 +205,9 @@ void M4xRegistry::upsert(std::vector<M4xInstalledApp>& apps, const M4xManifest& 
       a.version = m.version;
       a.versionCode = m.versionCode;
       a.path = installPath;
-      a.runtime = m.runtime;
-      a.entry = m.entry;
-      a.provider = m.provider;
+      a.runtime = runtime;
+      a.entry = entry;
+      a.provider = provider;
       a.icon = m.icon;
       a.permissions = m.permissions;
       a.files = inv;
@@ -193,9 +221,9 @@ void M4xRegistry::upsert(std::vector<M4xInstalledApp>& apps, const M4xManifest& 
   a.version = m.version;
   a.versionCode = m.versionCode;
   a.path = installPath;
-  a.runtime = m.runtime;
-  a.entry = m.entry;
-  a.provider = m.provider;
+  a.runtime = runtime;
+  a.entry = entry;
+  a.provider = provider;
   a.icon = m.icon;
   a.permissions = m.permissions;
   a.files = inv;
