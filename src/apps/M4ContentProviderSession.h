@@ -1,6 +1,9 @@
 #pragma once
 
 // Thread-safe runtime registry for provider-backed books (host-testable).
+// The registry is provider/book keyed. It intentionally does not bind itself
+// to one Lua app: native apps may hand off books and destroy their runtime,
+// and another native provider may be opened without a process restart.
 
 #include "util/M4ContentProviderContract.h"
 
@@ -21,8 +24,6 @@ using M4ContentProvider::PrefetchWork;
 
 struct BookState {
   BookSpec spec;
-  // Sparse per-index status. A 2,000+ chapter file catalog must not allocate a
-  // ChapterStatus/string set per row; entries appear only when fetched/cached.
   std::unordered_map<int, ChapterStatus> chapters;
   size_t chapterCount = 0;
   int lastOpenIndex0 = 0;
@@ -38,6 +39,8 @@ inline std::mutex& mu() {
   return m;
 }
 
+// Kept for source compatibility with older diagnostics. It is no longer used
+// as an authorization gate; app identity belongs in BookSpec, not a global.
 inline std::string& boundAppId() {
   static std::string id;
   return id;
@@ -48,7 +51,6 @@ inline std::unordered_map<std::string, BookState>& books() {
   return m;
 }
 
-// FIFO of bookId\0index encoded simply as pending list.
 inline std::vector<PrefetchWork>& workQ() {
   static std::vector<PrefetchWork> q;
   return q;
@@ -60,25 +62,34 @@ inline std::string bookKey(const std::string& providerId, const std::string& boo
 
 inline void clearForApp(const std::string& appId) {
   std::lock_guard<std::mutex> lock(mu());
-  boundAppId() = appId;
-  books().clear();
-  workQ().clear();
-  // Keep historyResume across clearForApp so Home→AppRuntime handoff works.
-  (void)appId;
+  // Old code assigned appId here and registerBook rejected a later different
+  // app forever. Native app handoff makes that assumption invalid. Clear the
+  // compatibility slot and remove only this app's states; an empty appId is
+  // the explicit global-reset form used at boot/tests.
+  boundAppId().clear();
+  if (appId.empty()) {
+    books().clear();
+    workQ().clear();
+    return;
+  }
+  for (auto it = books().begin(); it != books().end();) {
+    if (it->second.spec.appId == appId) it = books().erase(it);
+    else ++it;
+  }
+  auto& q = workQ();
+  q.erase(std::remove_if(q.begin(), q.end(), [&](const PrefetchWork& w) {
+            auto it = books().find(bookKey(w.providerId, w.bookId));
+            return it == books().end();
+          }), q.end());
 }
 
 inline bool registerBook(const BookSpec& in) {
   using namespace M4ContentProvider;
   if (validateBookSpec(in) != ValidationError::None) return false;
-  if (!in.appId.empty() && !boundAppId().empty() && in.appId != boundAppId()) return false;
 
   std::lock_guard<std::mutex> lock(mu());
-  if (!in.appId.empty()) boundAppId() = in.appId;
-
   const std::string key = bookKey(in.providerId, in.bookId);
-  // Preserve Ready / in-flight chapter status across re-register (openText,
-  // history TOC restore, return-to-toc). A wipe here used to drop a successful
-  // next-chapter prefetch so the reader always re-fetched and often failed.
+
   std::unordered_map<int, ChapterStatus> keepChapters;
   int keepLastOpen = 0;
   size_t keepByte = 0;
@@ -89,6 +100,10 @@ inline bool registerBook(const BookSpec& in) {
   {
     auto it = books().find(key);
     if (it != books().end()) {
+      // Never let another package silently re-bind an existing provider/book
+      // identity. Same app or an empty legacy appId is allowed.
+      if (!it->second.spec.appId.empty() && !in.appId.empty() &&
+          it->second.spec.appId != in.appId) return false;
       keepChapters = std::move(it->second.chapters);
       keepLastOpen = it->second.lastOpenIndex0;
       keepByte = it->second.lastByteOffset;
@@ -111,17 +126,13 @@ inline bool registerBook(const BookSpec& in) {
     cs.state = ChapterReady::Missing;
     cs.pct = 0;
   }
-  // Merge preserved statuses for indices still in range (FileRows sparse map).
   for (auto& kv : keepChapters) {
     const int idx = kv.first;
     if (idx < 0 || static_cast<size_t>(idx) >= st.chapterCount) continue;
     ChapterStatus& prev = kv.second;
     if (prev.state != ChapterReady::Ready && prev.state != ChapterReady::Fetching &&
-        prev.state != ChapterReady::Error) {
-      continue;
-    }
+        prev.state != ChapterReady::Error) continue;
     ChapterStatus& cs = st.chapters[idx];
-    // Prefer non-empty UID from either side.
     if (cs.chapterUid.empty() && !prev.chapterUid.empty()) cs.chapterUid = prev.chapterUid;
     if (!prev.chapterUid.empty() && (cs.chapterUid.empty() || cs.chapterUid == prev.chapterUid)) {
       cs = prev;
@@ -137,7 +148,7 @@ inline bool registerBook(const BookSpec& in) {
   }
   if (in.currentIndex0 >= 0 && static_cast<size_t>(in.currentIndex0) < st.chapterCount) {
     st.lastOpenIndex0 = in.currentIndex0;
-  } else if (static_cast<size_t>(keepLastOpen) < st.chapterCount) {
+  } else if (keepLastOpen >= 0 && static_cast<size_t>(keepLastOpen) < st.chapterCount) {
     st.lastOpenIndex0 = keepLastOpen;
   }
   st.lastByteOffset = keepByte;
@@ -151,19 +162,13 @@ inline bool registerBook(const BookSpec& in) {
 
 inline bool setChapterStatus(const ChapterStatus& in) {
   using namespace M4ContentProvider;
-  // providerId is mandatory so two providers with the same bookId cannot cross-update.
-  if (!idOk(in.providerId.c_str(), kMaxProviderIdLen) || !idOk(in.bookId.c_str(), kMaxBookIdLen)) {
-    return false;
-  }
+  if (!idOk(in.providerId.c_str(), kMaxProviderIdLen) || !idOk(in.bookId.c_str(), kMaxBookIdLen)) return false;
   std::lock_guard<std::mutex> lock(mu());
   auto it = books().find(bookKey(in.providerId, in.bookId));
   if (it == books().end()) return false;
   BookState& st = it->second;
   if (st.spec.catalog.kind == M4ContentProvider::ChapterCatalogKind::FileRows &&
       (in.state == ChapterReady::Fetching || in.state == ChapterReady::Ready) && in.chapterUid.empty()) {
-    // A file catalog must be resolved by index before a provider can enter a
-    // network-fetch or ready state. This prevents an empty UID from crossing
-    // the provider boundary even if a Lua pump forgets to call the resolver.
     return false;
   }
   int idx = in.index0;
@@ -197,30 +202,23 @@ inline bool setChapterStatus(const ChapterStatus& in) {
   cs.index0 = idx;
   if (in.state == ChapterReady::Ready) {
     auto& q = workQ();
-    q.erase(std::remove_if(q.begin(), q.end(),
-                           [&](const PrefetchWork& w) {
-                             return w.providerId == in.providerId && w.bookId == in.bookId && w.index0 == idx;
-                           }),
-            q.end());
+    q.erase(std::remove_if(q.begin(), q.end(), [&](const PrefetchWork& w) {
+              return w.providerId == in.providerId && w.bookId == in.bookId && w.index0 == idx;
+            }), q.end());
   }
   return true;
 }
 
-// Pending history resume when user opens m4cp:// (with or without local cache).
-// Cold reopen must carry last chapter identity so the plugin can open the
-// cached body before login/session/TOC network work.
 struct HistoryResume {
   bool pending = false;
   std::string appId;
   std::string providerId;
   std::string bookId;
   std::string title;
-  // Last native-reader location.  These let a cold history reopen enter the
-  // cached chapter before the provider has rebuilt its shelf/TOC session.
   std::string chapterUid;
   std::string cacheRelPath;
-  int chapterIndex0 = 0;   // 0-based when known; -1 = unknown
-  size_t byteOffset = 0;   // raw file offset when known (0 = start / unknown)
+  int chapterIndex0 = 0;
+  size_t byteOffset = 0;
   bool hasByteOffset = false;
 };
 
@@ -245,6 +243,7 @@ inline bool takeHistoryResume(HistoryResume& out) {
 
 inline ChapterStatus chapterAt(const std::string& providerId, const std::string& bookId, int index0) {
   ChapterStatus out;
+  out.providerId = providerId;
   out.bookId = bookId;
   out.index0 = index0;
   out.state = ChapterReady::Missing;
@@ -255,10 +254,7 @@ inline ChapterStatus chapterAt(const std::string& providerId, const std::string&
   if (index0 < 0 || static_cast<size_t>(index0) >= st.chapterCount) return out;
   auto found = st.chapters.find(index0);
   if (found != st.chapters.end()) return found->second;
-  out.providerId = providerId;
-  if (static_cast<size_t>(index0) < st.spec.chapters.size()) {
-    out.chapterUid = st.spec.chapters[static_cast<size_t>(index0)].uid;
-  }
+  if (static_cast<size_t>(index0) < st.spec.chapters.size()) out.chapterUid = st.spec.chapters[static_cast<size_t>(index0)].uid;
   return out;
 }
 
@@ -277,9 +273,7 @@ inline bool requestPrefetch(const std::string& providerId, const std::string& bo
     cs.chapterUid = st.spec.chapters[static_cast<size_t>(index0)].uid;
   }
   if (cs.state == ChapterReady::Ready) return false;
-  if (cs.state == ChapterReady::Fetching) {
-    // Already in flight — ensure work queued once.
-  } else {
+  if (cs.state != ChapterReady::Fetching) {
     cs.state = ChapterReady::Fetching;
     cs.pct = std::max(cs.pct, 1);
   }
@@ -306,17 +300,12 @@ inline PrefetchWork pollWork() {
   return out;
 }
 
-// Return only the registered catalog descriptor for one queued index. The
-// descriptor is copied by value; no chapter rows or UID vectors are retained
-// in the provider registry.
 inline bool catalogFor(const std::string& providerId, const std::string& bookId, int index0,
                        M4ContentProvider::ChapterCatalogSpec& out) {
   std::lock_guard<std::mutex> lock(mu());
   auto it = books().find(bookKey(providerId, bookId));
   if (it == books().end() || it->second.spec.catalog.kind != M4ContentProvider::ChapterCatalogKind::FileRows ||
-      index0 < 0 || static_cast<size_t>(index0) >= it->second.chapterCount) {
-    return false;
-  }
+      index0 < 0 || static_cast<size_t>(index0) >= it->second.chapterCount) return false;
   out = it->second.spec.catalog;
   return true;
 }
@@ -325,9 +314,7 @@ inline void noteOpen(const std::string& providerId, const std::string& bookId, i
   std::lock_guard<std::mutex> lock(mu());
   auto it = books().find(bookKey(providerId, bookId));
   if (it == books().end()) return;
-  if (index0 >= 0 && static_cast<size_t>(index0) < it->second.chapterCount) {
-    it->second.lastOpenIndex0 = index0;
-  }
+  if (index0 >= 0 && static_cast<size_t>(index0) < it->second.chapterCount) it->second.lastOpenIndex0 = index0;
   it->second.lastByteOffset = byteOffset;
   it->second.hasLastByteOffset = true;
 }
@@ -341,9 +328,7 @@ inline bool noteProgress(const std::string& providerId, const std::string& bookI
   if (!M4ContentProvider::validReadPosition(position, st.chapterCount)) return false;
   auto found = st.chapters.find(position.chapterIndex0);
   if (found != st.chapters.end() && !position.chapterUid.empty() &&
-      !found->second.chapterUid.empty() && position.chapterUid != found->second.chapterUid) {
-    return false;
-  }
+      !found->second.chapterUid.empty() && position.chapterUid != found->second.chapterUid) return false;
   st.lastOpenIndex0 = position.chapterIndex0;
   st.lastByteOffset = position.byteOffset;
   st.hasLastByteOffset = position.hasByteOffset;
@@ -374,7 +359,6 @@ inline HistoryEntry makeHistorySnapshot(const std::string& providerId, const std
   return h;
 }
 
-// Prefer last open Ready chapter; else first Ready chapter.
 inline bool resolveReopen(const std::string& providerId, const std::string& bookId, ChapterStatus& out) {
   std::lock_guard<std::mutex> lock(mu());
   auto it = books().find(bookKey(providerId, bookId));
@@ -395,13 +379,11 @@ inline bool resolveReopen(const std::string& providerId, const std::string& book
   int earliest = -1;
   for (const auto& item : st.chapters) {
     const ChapterStatus& cs = item.second;
-    if (cs.state == ChapterReady::Ready && !cs.cacheRelPath.empty() &&
-        (earliest < 0 || item.first < earliest)) {
+    if (cs.state == ChapterReady::Ready && !cs.cacheRelPath.empty() && (earliest < 0 || item.first < earliest)) {
       earliest = item.first;
     }
   }
-  if (earliest >= 0 && tryIdx(earliest)) return true;
-  return false;
+  return earliest >= 0 && tryIdx(earliest);
 }
 
 inline bool markHistoryRegistered(const std::string& providerId, const std::string& bookId) {
@@ -415,8 +397,7 @@ inline bool markHistoryRegistered(const std::string& providerId, const std::stri
 inline bool isHistoryRegistered(const std::string& providerId, const std::string& bookId) {
   std::lock_guard<std::mutex> lock(mu());
   auto it = books().find(bookKey(providerId, bookId));
-  if (it == books().end()) return false;
-  return it->second.historyRegistered;
+  return it != books().end() && it->second.historyRegistered;
 }
 
 inline size_t bookCount() {
