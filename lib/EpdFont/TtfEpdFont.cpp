@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 
 namespace {
 
@@ -48,8 +49,20 @@ TtfEpdFont::TtfEpdFont(const String& path, uint16_t sizePx) : EpdFont(&data_), p
 #if defined(ESP32)
   mutex_ = xSemaphoreCreateMutex();
 #endif
-  for (int i = 0; i < kMaxSlots; i++) {
-    entries_[i].cp = 0xFFFFFFFF;
+
+  // Keep the 512-entry lookup/LRU table off the scarce internal heap. With the
+  // previous embedded array every TTF size permanently consumed ~tens of KB of
+  // internal RAM before a single glyph bitmap was cached; six UI/body sizes
+  // multiplied that cost and starved TLS. Bitmaps already use this PSRAM-first
+  // allocator, so the whole cache hierarchy now lives off-chip.
+  entries_ = static_cast<Entry*>(ttfAlloc(sizeof(Entry) * kMaxSlots));
+  if (!entries_) {
+    Serial.printf("[TTF] Failed to allocate glyph metadata (%u bytes)\n",
+                  static_cast<unsigned>(sizeof(Entry) * kMaxSlots));
+    return;
+  }
+  for (int i = 0; i < kMaxSlots; ++i) {
+    new (&entries_[i]) Entry();
   }
 
   auto* s = new SdTtfStream();
@@ -91,12 +104,20 @@ TtfEpdFont::TtfEpdFont(const String& path, uint16_t sizePx) : EpdFont(&data_), p
   data_.is2Bit = true;
 
   valid_ = true;
-  Serial.printf("[TTF] Loaded %s @%upx (unitsPerEm=%u lineH=%u asc=%d desc=%d)\n", path_.c_str(), sizePx_,
-                font_.unitsPerEm(), data_.advanceY, data_.ascender, data_.descender);
+  Serial.printf("[TTF] Loaded %s @%upx (unitsPerEm=%u lineH=%u asc=%d desc=%d cache_meta=%u)\n", path_.c_str(),
+                sizePx_, font_.unitsPerEm(), data_.advanceY, data_.ascender, data_.descender,
+                static_cast<unsigned>(sizeof(Entry) * kMaxSlots));
 }
 
 TtfEpdFont::~TtfEpdFont() {
   clearCaches();
+  if (entries_) {
+    for (int i = 0; i < kMaxSlots; ++i) {
+      entries_[i].~Entry();
+    }
+    ttfFree(entries_);
+    entries_ = nullptr;
+  }
   delete stream_;
   stream_ = nullptr;
 #if defined(ESP32)
@@ -108,7 +129,7 @@ TtfEpdFont::~TtfEpdFont() {
 }
 
 void TtfEpdFont::evictSlot(int slot) const {
-  if (slot < 0 || slot >= kMaxSlots) return;
+  if (!entries_ || slot < 0 || slot >= kMaxSlots) return;
   if (entries_[slot].bitmap) {
     ttfFree(entries_[slot].bitmap);
     cacheBytes_ -= entries_[slot].bitmapSize;
@@ -120,8 +141,10 @@ void TtfEpdFont::clearCaches() {
 #if defined(ESP32)
   if (mutex_) xSemaphoreTake(mutex_, portMAX_DELAY);
 #endif
-  for (int i = 0; i < kMaxSlots; i++) {
-    evictSlot(i);
+  if (entries_) {
+    for (int i = 0; i < kMaxSlots; i++) {
+      evictSlot(i);
+    }
   }
   font_.clearScratch();
 #if defined(ESP32)
@@ -130,7 +153,7 @@ void TtfEpdFont::clearCaches() {
 }
 
 int TtfEpdFont::ensureGlyph(uint32_t cp) const {
-  if (!valid_) return -1;
+  if (!valid_ || !entries_) return -1;
 
   // Hit.
   for (int i = 0; i < kMaxSlots; i++) {
