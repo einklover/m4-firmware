@@ -6,6 +6,7 @@ on:
     paths:
       - 'src/**'
       - 'lib/**'
+      - 'tests/native_app/**'
       - 'platformio.ini'
       - '.github/workflows/native-app-build.yml'
   workflow_dispatch:
@@ -40,7 +41,15 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Run existing host tests
+      - name: Compile native UI contract tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -Isrc \
+            tests/native_app/test_native_ui.cpp \
+            src/apps/native/M4NativeUi.cpp \
+            -o /tmp/test_native_ui
+          /tmp/test_native_ui
+
+      - name: Run existing host tests when available
         shell: bash
         run: |
           set -euo pipefail
@@ -49,5 +58,5 @@ jobs:
           elif [ -x test/run_tests.sh ]; then
             test/run_tests.sh
           else
-            echo 'No aggregate host-test runner found; build job remains authoritative.'
+            echo 'No aggregate legacy host-test runner found.'
           fi
