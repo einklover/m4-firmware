@@ -1,5 +1,6 @@
 #include "NativeAppActivity.h"
 #include "NativeProviderBookActivity.h"
+#include "NativeProviderLoginActivity.h"
 
 #include <GfxRenderer.h>
 #include <HalDisplay.h>
@@ -209,9 +210,21 @@ void NativeAppActivity::handleAction(const std::string& action, const M4NativeUi
           }));
       return;
     }
-    case M4NativeUi::ActionKind::OpenLogin:
-      setError("native_login_not_bound");
+    case M4NativeUi::ActionKind::OpenLogin: {
+      const std::string providerId = result.payload.empty() ? app_.provider : result.payload;
+      if (providerId.empty()) {
+        setError("provider_login_missing_id");
+        return;
+      }
+      const std::string appDataRoot = std::string("/apps_data/") + app_.id;
+      enterNewActivity(new NativeProviderLoginActivity(
+          renderer, mappedInput, providerId, appDataRoot,
+          [this](bool /*ok*/) {
+            requestExitSubActivity();
+            updateRequired_ = true;
+          }));
       return;
+    }
     case M4NativeUi::ActionKind::Error:
       setError(result.error.empty() ? "native_action_failed" : result.error);
       return;
