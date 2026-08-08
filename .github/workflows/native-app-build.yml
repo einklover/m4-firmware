@@ -97,7 +97,20 @@ jobs:
         run: python -m pip install --disable-pip-version-check platformio==6.1.18
 
       - name: Build Murphy M4
-        run: pio run -e murphy_m4
+        shell: bash
+        run: |
+          set +e
+          pio run -e murphy_m4 > /tmp/m4-build.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo '=== compiler diagnostics ==='
+            grep -nE '(^|: )(fatal error:|error:|undefined reference|collect2:)' /tmp/m4-build.log | tail -n 120 || true
+            echo '=== build tail ==='
+            tail -n 160 /tmp/m4-build.log
+            exit "$rc"
+          fi
+          tail -n 40 /tmp/m4-build.log
 
   host-tests:
     runs-on: ubuntu-latest
