@@ -16,6 +16,7 @@
 #include "MappedInputManager.h"
 #include "ReadingStatsStore.h"
 #include "util/M4PluginReaderBridge.h"
+#include "apps/M4PluginReaderSession.h"
 #include "util/M4PluginTocList.h"
 #include "util/M4PluginTidxCodec.h"
 #include "util/M4PluginReaderStatePolicy.h"
@@ -650,6 +651,11 @@ bool TxtReaderActivity::switchToProviderChapter(const std::string& cacheRelPath,
 
   auto nextTxt = std::make_unique<Txt>(abs, "/.crosspoint");
   if (!nextTxt->load() || !nextTxt->isEncodingSupported()) return false;
+  // A provider chapter that downloaded but wrote an empty/partial body (e.g.
+  // prefetch TLS handshake failed under low internal RAM) must NOT open as a
+  // blank page with no status bar. Refuse; the caller shows the wait overlay
+  // and the provider re-fetches.
+  if (nextTxt->getFileSize() == 0) return false;
 
   // Persist outgoing chapter progress while old txt is still valid.
   saveProgress();
@@ -736,27 +742,42 @@ bool TxtReaderActivity::tryProviderNextChapterAdvance() {
   }
   if (d.action == M4ContentProvider::NextChapterDecision::Action::OpenReady) {
     // Title resolved from the plugin TOC inside switchToProviderChapter.
-    return switchToProviderChapter(st.cacheRelPath, next, st.chapterUid, /*title=*/"");
+    if (switchToProviderChapter(st.cacheRelPath, next, st.chapterUid, /*title=*/"")) return true;
+    // Cache said Ready but the file is empty/partial (prefetch TLS handshake
+    // failed under low internal RAM). Fall through to the queueOpen path below:
+    // the plugin UI shows "下载章节…" and re-downloads, exactly like picking
+    // the chapter from the list.
+    Serial.printf("[WR05] t=%lu next_chapter_empty → list-style open idx=%d\n", millis(), next);
   }
   if (d.action == M4ContentProvider::NextChapterDecision::Action::WaitOverlay ||
-      d.action == M4ContentProvider::NextChapterDecision::Action::RequestAndWait) {
-    // Only a state transition (Missing→Fetching→Error/Ready) may repaint the
-    // panel. pct ticks used to force a full-frame FAST every change → residual/
-    // ghost builds up on the body text. pct-only updates refresh the in-memory
-    // string, and the next real redraw (state change / page turn) shows it.
-    const M4ContentProvider::ChapterReady newState = st.state;
-    const bool stateChanged = (newState != providerOverlayState_);
-    providerOverlayState_ = newState;
-    providerOverlayMsg_ = M4ContentProvider::overlayMessage(st, /*fontOk=*/true);
-    if (stateChanged) {
-      // Force a physical drive for the new overlay (skip-same-page would block it).
-      lastPhysicalBodyPage_ = -1;
-      updateRequired = true;
+      d.action == M4ContentProvider::NextChapterDecision::Action::RequestAndWait ||
+      (d.action == M4ContentProvider::NextChapterDecision::Action::OpenReady)) {
+    // Next chapter is not openable from cache right now. Hand it to the plugin
+    // UI exactly like a list selection: queue an open for chapter `next` and
+    // leave the native reader — the plugin shows its "下载章节… / 检查缓存…"
+    // flow, downloads if needed, and opens the chapter when ready. This makes
+    // "next page at chapter end" behave like picking from the chapter list
+    // (loading page first, never a dead tap or blank reader).
+    M4PluginReaderBridge::OpenRequest req;
+    req.appId = pluginSession_.appId;
+    req.bookId = pluginSession_.bookId;
+    req.chapterUid = st.chapterUid;
+    req.chapterIndex = next;
+    req.providerId = pluginSession_.providerId;
+    req.relPath = st.cacheRelPath;  // empty when not ready; provider resolves it
+    {
+      std::string t;
+      (void)resolvePluginTitle(pluginSession_, next, t);
+      req.title = t;
     }
-    Serial.printf("[WRCP] t=%lu next_wait state=%s pct=%d state_changed=%d\n",
-                  static_cast<unsigned long>(millis()),
-                  M4ContentProvider::stateKey(st.state), st.pct, stateChanged ? 1 : 0);
-    return true;  // consumed — stay in native reader
+    req.pendingComplete = false;
+    (void)M4PluginReaderSession::queueOpen(req);
+    Serial.printf("[WR05] t=%lu next_chapter queue_open idx=%d state=%s\n", millis(), next,
+                  M4ContentProvider::stateKey(st.state));
+    // Leave the native reader; AppRuntimeActivity picks up the open and the
+    // plugin shows its loading flow.
+    requestPluginClose();
+    return true;
   }
   return false;
 }
@@ -844,7 +865,11 @@ void TxtReaderActivity::pageTurnLocked(int delta) {
     }
   }
   // Provider-managed multi-chapter: last page next → seamless open or overlay wait.
-  if (pluginSession_.active && pluginSession_.providerManaged && signedStep > 0 && indexComplete_ &&
+  // Provider open is a hard content switch (network/cache) — keep immediate path.
+  // No indexComplete_ gate: a chapter-end next tap must advance even while the
+  // current chapter's progressive index is still growing (otherwise nothing
+  // happens — the "dead" tap).
+  if (pluginSession_.active && pluginSession_.providerManaged && signedStep > 0 &&
       currentPage >= totalPages - 1) {
     unlockState();
     if (tryProviderNextChapterAdvance()) return;
@@ -1942,7 +1967,8 @@ void TxtReaderActivity::displayTaskLoop() {
           int guard = 0;
           while (currentPage >= static_cast<int>(pageOffsets.size()) && !indexComplete_ &&
                  guard++ < 128) {
-            continuePageIndex(16, 256 * 1024);
+            const int added = continuePageIndex(16, 256 * 1024);
+            if (added <= 0) break;  // no progress — do not spin
           }
           totalPages = static_cast<int>(pageOffsets.size());
           applyPendingRestoreIfReady();
@@ -2153,6 +2179,7 @@ void TxtReaderActivity::chapter_initializeReader(int chapter_num) {
   if (chapter_initialized) {
     return;
   }
+  const uint32_t tChInit = millis();
 
   // 章节重新初始化时清除页面缓存
   cachedPage = -1;
@@ -3912,14 +3939,15 @@ void TxtReaderActivity::renderScreen() {
     const uint32_t tIdx = millis();
     int guard = 0;
     while (currentPage >= static_cast<int>(pageOffsets.size()) && !indexComplete_ && guard++ < 128) {
-      continuePageIndex(16, 256 * 1024);
+      const int added = continuePageIndex(16, 256 * 1024);
+      if (added <= 0) break;  // no progress (file issue?) — do not spin forever
     }
     totalPages = static_cast<int>(pageOffsets.size());
     applyPendingRestoreIfReady();
     logPerf("index_to_target", millis() - tIdx, currentPage,
             static_cast<uint32_t>(pageOffsets.size()));
     if (currentPage >= static_cast<int>(pageOffsets.size())) {
-      updateRequired = true;  // still not covered (guard hit) — retry next tick
+      updateRequired = true;  // still not covered — retry next tick (bounded)
       return;
     }
     // Covered → fall through and render now.

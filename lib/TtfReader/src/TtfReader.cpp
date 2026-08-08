@@ -83,6 +83,26 @@ void* ttfRealloc(void* ptr, size_t n) {
 #endif
 }
 
+// PSRAM-first realloc for the font-file slice and packed-bitmap scratch: these
+// are high-water buffers that grow to the largest rendered glyph and stay
+// resident. glyf slice is read+parsed once per glyph (not per-pixel hot), and
+// packed is the final 2-bit output — both are fine on PSRAM and it keeps them
+// out of the ~320KB internal heap (which must host mbedTLS/WiFi/reader).
+void* ttfReallocPsram(void* ptr, size_t n) {
+  if (n == 0) {
+    ttfFree(ptr);
+    return nullptr;
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  // heap_caps_realloc migrates the block if caps differ.
+  void* p = heap_caps_realloc(ptr, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = heap_caps_realloc(ptr, n, MALLOC_CAP_8BIT);
+  return p;
+#else
+  return std::realloc(ptr, n);
+#endif
+}
+
 }  // namespace
 
 uint32_t TtfFont::tagKey(const char tag[4]) {
@@ -502,7 +522,7 @@ bool TtfFont::collectGlyph(uint16_t gid, const Xform& xf, std::vector<Contour>& 
 
   const uint32_t sliceLen = gEnd - gStart;
   if (sliceLen > glyfScratchCap_) {
-    uint8_t* nb = (uint8_t*)ttfRealloc(glyfScratch_, sliceLen);
+    uint8_t* nb = (uint8_t*)ttfReallocPsram(glyfScratch_, sliceLen);
     if (!nb) return false;
     glyfScratch_ = nb;
     glyfScratchCap_ = sliceLen;
@@ -897,7 +917,7 @@ bool TtfFont::rasterize(uint16_t gid, uint16_t sizePx, GlyphBitmap& out) {
   // Pack 2-bit (0=white .. 3=black), 4 px/byte MSB-first.
   const uint32_t packedLen = (npix + 3) / 4;
   if (packedLen > packedScratchCap_) {
-    uint8_t* nb = (uint8_t*)ttfRealloc(packedScratch_, packedLen);
+    uint8_t* nb = (uint8_t*)ttfReallocPsram(packedScratch_, packedLen);
     if (!nb) return false;
     packedScratch_ = nb;
     packedScratchCap_ = packedLen;

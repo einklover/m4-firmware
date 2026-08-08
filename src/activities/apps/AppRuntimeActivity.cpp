@@ -5,6 +5,7 @@
 
 #include <GfxRenderer.h>
 #include <Txt.h>
+#include <SDCardManager.h>
 
 #include "MappedInputManager.h"
 #include "fontIds.h"
@@ -490,11 +491,30 @@ void AppRuntimeActivity::tryLaunchPluginReader() {
   host_.releaseNetworkSession();
   const uint32_t tLoad0 = millis();
   auto txt = std::make_unique<Txt>(req.absPath, "/.crosspoint");
+  const uint32_t tLoadStart = millis();
   const bool loaded = txt->load();
+  const uint32_t tLoadMs = millis() - tLoadStart;
   Serial.printf("[WR05] t=%lu txt_load ok=%d ms=%lu size=%u enc_ok=%d\n", static_cast<unsigned long>(millis()),
-                loaded ? 1 : 0, static_cast<unsigned long>(millis() - tLoad0),
+                loaded ? 1 : 0, static_cast<unsigned long>(tLoadMs),
                 loaded ? static_cast<unsigned>(txt->getFileSize()) : 0u,
                 (loaded && txt->isEncodingSupported()) ? 1 : 0);
+  // Diagnostic to SD (serial unreliable): a slow Txt::load on the main loop is
+  // the classic "open book → watchdog reboot" — long blocking SD scan.
+  {
+    FsFile df = SdMan.open("apps_data/com.jjwxc.client/logs/reader_open.log",
+                           O_WRONLY | O_CREAT | O_APPEND);
+    if (df) {
+      char line[160];
+      const int n = snprintf(line, sizeof(line),
+                             "[%lu] open path=%s load_ms=%lu ok=%d size=%u free=%u\n",
+                             (unsigned long)millis(), req.relPath.c_str(), (unsigned long)tLoadMs,
+                             loaded ? 1 : 0,
+                             loaded ? (unsigned)txt->getFileSize() : 0u,
+                             (unsigned)ESP.getFreeHeap());
+      if (n > 0) df.write(reinterpret_cast<const uint8_t*>(line), (size_t)n);
+      df.close();
+    }
+  }
   if (!loaded || !txt->isEncodingSupported()) {
     // Explicit open failure — never looks like a successful close at page 1.
     M4PluginReaderSession::ProgressSnapshot snap;

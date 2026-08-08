@@ -238,6 +238,23 @@ bool Session::connectHttp(const std::string& url,
   const int code = http_->GET();
   if (code != HTTP_CODE_OK) {
     err = (code < 0) ? "http_request_failed" : "http_error";
+    // Diagnostic: serial is unreliable on M4; record internal heap state at
+    // TLS handshake failure (jjwxc chapter/TOC fetch failing). Largest free
+    // block tells us if the ~40KB mbedTLS handshake requirement was met.
+#if defined(ARDUINO_ARCH_ESP32)
+    FsFile df = SdMan.open("apps_data/com.jjwxc.client/logs/loader_heap.log",
+                           O_WRONLY | O_CREAT | O_APPEND);
+    if (df) {
+      char line[160];
+      const int n = snprintf(line, sizeof(line),
+                             "[%lu] loader_fail err=%s code=%d ifree=%u largest=%u\n",
+                             (unsigned long)millis(), err.c_str(), code,
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+      if (n > 0) df.write(reinterpret_cast<const uint8_t*>(line), (size_t)n);
+      df.close();
+    }
+#endif
     return false;
   }
   const int cl = http_->getSize();

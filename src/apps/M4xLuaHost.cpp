@@ -2067,7 +2067,7 @@ int l_net_request(lua_State* L) {
   lua_gc(L, LUA_GCCOLLECT, 0);
   const size_t largestInternal =
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (largestInternal < 40 * 1024) {
+  if (largestInternal < 32 * 1024) {
     Serial.printf("[M4xNet] TLS skipped: internal largest=%u free=%u psram=%u lua=%u/%u\n",
                   static_cast<unsigned>(largestInternal),
                   static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
@@ -2398,7 +2398,7 @@ int l_net_extractPsvts(lua_State* L) {
   lua_gc(L, LUA_GCCOLLECT, 0);
   const size_t largestInternal =
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (largestInternal < 40 * 1024) {
+  if (largestInternal < 32 * 1024) {
     Serial.printf("[M4xNet] TLS skipped (extractPsvts): internal largest=%u free=%u psram=%u lua=%u/%u\n",
                   static_cast<unsigned>(largestInternal),
                   static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
@@ -3712,7 +3712,7 @@ int l_dl_jsonGet(lua_State* L) {
       lua_gc(L, LUA_GCCOLLECT, 0);
       const size_t largestInternal =
           heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      if (largestInternal < 40 * 1024) {
+      if (largestInternal < 32 * 1024) {
         Serial.printf("[M4xNet] dl.jsonGet TLS skipped: internal largest=%u free=%u psram=%u lua=%u/%u\n",
                       static_cast<unsigned>(largestInternal),
                       static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
