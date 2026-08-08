@@ -33,12 +33,10 @@ class UITheme {
     }
     void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                          const char* btn4, bool force = false) const {
-#if defined(CROSSPOINT_MURPHY_M4)
       if (M4TouchNavigation::enabled()) {
         M4TouchNavigation::drawBottomBar(renderer);
         return;
       }
-#endif
       owner_.getTheme().drawButtonHints(renderer, btn1, btn2, btn3, btn4, force);
     }
     void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn,
@@ -105,5 +103,10 @@ class UITheme {
   Facade facade{*this};
 };
 
-// Helper macro to access current theme through the M4 navigation facade.
+// Preserve the exact old theme type on X3/X4. Only Murphy M4 needs the touch
+// navigation facade, minimizing behavioral risk for button-only devices.
+#if defined(CROSSPOINT_MURPHY_M4)
 #define GUI UITheme::getInstance().getFacade()
+#else
+#define GUI UITheme::getInstance().getTheme()
+#endif
