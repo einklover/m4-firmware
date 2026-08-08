@@ -251,14 +251,8 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
     activeRuntimeTtfSize = -1;
     logFontHeap("after_release");
   } else {
-    // loadFontsFromSd() clears loadedCustomIds before deciding whether the
-    // expensive TTF face can be reused. Re-register the still-live renderer
-    // mapping so getBestFontId()/getReaderFontId() keep returning the TTF hash
-    // ID instead of silently falling back to the OMIT_FONTS builtin CJK subset.
-    const int runtimeId = hashFontId(d.loadCustomFamily.c_str(), runtimeReaderSize);
-    loadedCustomIds.push_back(runtimeId);
-    Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx id=%d (registration retained)\n",
-                  d.loadCustomFamily.c_str(), runtimeReaderSize, runtimeId);
+    Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx\n",
+                  d.loadCustomFamily.c_str(), runtimeReaderSize);
   }
 
   // 1) Explicit CUSTOM family → reader hash IDs. Runtime TTF is deliberately
@@ -363,5 +357,11 @@ int EpdFontLoader::getBestFontId(const char* familyName, int size) {
   for (int loadedId : loadedCustomIds) {
     if (loadedId == id) return id;
   }
+#ifdef CROSSPOINT_MURPHY_M4
+  // The active runtime face is the source of truth. Bookkeeping is rebuilt on
+  // every SD/font refresh, but a successfully retained TTF face and renderer
+  // mapping must never silently degrade to the compact OMIT_FONTS fallback.
+  if (activeRuntimeTtfFamily == familyName && activeRuntimeTtfSize == size) return id;
+#endif
   return -1;
 }
