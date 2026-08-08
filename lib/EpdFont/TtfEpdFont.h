@@ -44,7 +44,9 @@ class TtfEpdFont : public EpdFont {
     uint32_t bitmapSize = 0;
   };
 
-  // Slot count bounds cache memory to kCacheBudget regardless of glyph size.
+  // Slot metadata is allocated from PSRAM at runtime rather than embedded in
+  // the face object. This keeps the scarce internal heap close to epdfont's
+  // model: RAM holds small handles/addresses while glyph data lives off-chip.
   static constexpr int kMaxSlots = 512;
   static constexpr size_t kCacheBudget = 768 * 1024;
 
@@ -61,7 +63,7 @@ class TtfEpdFont : public EpdFont {
   ttf::TtfStream* stream_ = nullptr;  // owned
   mutable ttf::TtfFont font_;
 
-  mutable Entry entries_[kMaxSlots];
+  mutable Entry* entries_ = nullptr;  // kMaxSlots, PSRAM-first
   mutable uint32_t accessCounter_ = 0;
   mutable size_t cacheBytes_ = 0;
 #if defined(ESP32)
