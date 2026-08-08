@@ -22,4 +22,5 @@ class FullScreenMessageActivity final : public Activity {
         refreshMode(refreshMode) {}
   void onEnter() override;
   void loop() override;
+  bool showTouchNavigation() const override { return false; }
 };
