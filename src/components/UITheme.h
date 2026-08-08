@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "CrossPointSettings.h"
@@ -21,6 +22,8 @@ class UITheme {
   class Facade {
    public:
     explicit Facade(const UITheme& owner) : owner_(owner) {}
+
+    operator const BaseTheme&() const { return owner_.getTheme(); }
 
     void drawProgressBar(const GfxRenderer& renderer, Rect rect, size_t current, size_t total) const {
       owner_.getTheme().drawProgressBar(renderer, rect, current, total);
