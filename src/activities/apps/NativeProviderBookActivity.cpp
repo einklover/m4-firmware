@@ -1,4 +1,5 @@
 #include "NativeProviderBookActivity.h"
+#include "NativeProviderLoginActivity.h"
 
 #include "activities/reader/TxtReaderActivity.h"
 #include "activities/reader/TxtReaderChapterSelectionActivity.h"
@@ -73,8 +74,7 @@ bool NativeProviderBookActivity::prepareCatalog() {
     return false;
   }
   chapterCount_ = static_cast<int>(titles_->rowCount());
-  if (currentIndex_ < 0) currentIndex_ = 0;
-  if (currentIndex_ >= chapterCount_) currentIndex_ = chapterCount_ - 1;
+  currentIndex_ = std::max(0, std::min(currentIndex_, chapterCount_ - 1));
   return true;
 }
 
@@ -135,6 +135,25 @@ void NativeProviderBookActivity::requestChapter(int index0) {
   renderLoading(true);
 }
 
+void NativeProviderBookActivity::openLogin() {
+  if (providerId_ != "weread" && providerId_ != "jjwxc") {
+    error_ = "此内容源不支持登录";
+    state_ = State::Error;
+    renderError();
+    return;
+  }
+  loginFinishedPending_ = false;
+  loginSucceeded_ = false;
+  state_ = State::Login;
+  enterNewActivity(new NativeProviderLoginActivity(
+      renderer, mappedInput, providerId_, appDataRoot_,
+      [this](bool success) {
+        loginSucceeded_ = success;
+        loginFinishedPending_ = true;
+        requestExitSubActivity();
+      }));
+}
+
 bool NativeProviderBookActivity::openReadyReader(int index0) {
   const auto st = M4ContentProviderSession::chapterAt(providerId_, bookId_, index0);
   if (st.state != M4ContentProvider::ChapterReady::Ready || st.cacheRelPath.empty()) return false;
@@ -190,12 +209,13 @@ bool NativeProviderBookActivity::openReadyReader(int index0) {
 
 void NativeProviderBookActivity::renderLoading(bool force) {
   const uint32_t now = millis();
-  auto p = M4NativeProviderManager::progress();
+  const auto p = M4NativeProviderManager::progress();
   const auto st = M4ContentProviderSession::chapterAt(providerId_, bookId_, loadingIndex_);
   std::string phase = "准备章节";
   size_t received = 0;
   size_t written = 0;
   int pct = st.pct;
+  bool authRequired = false;
   if (p.providerId == providerId_ && p.bookId == bookId_ && p.chapterIndex0 == loadingIndex_) {
     received = p.receivedBytes;
     written = p.writtenBytes;
@@ -206,7 +226,10 @@ void NativeProviderBookActivity::renderLoading(bool force) {
       case M4NativeProvider::Phase::Receiving: phase = "接收正文"; break;
       case M4NativeProvider::Phase::Decoding: phase = "处理正文"; break;
       case M4NativeProvider::Phase::Writing: phase = "写入缓存"; break;
-      case M4NativeProvider::Phase::AuthRequired: phase = "需要重新登录"; break;
+      case M4NativeProvider::Phase::AuthRequired:
+        phase = "需要重新登录";
+        authRequired = true;
+        break;
       case M4NativeProvider::Phase::Error: phase = "加载失败"; break;
       case M4NativeProvider::Phase::Cancelled: phase = "已取消"; break;
       case M4NativeProvider::Phase::Ready: phase = "准备打开"; break;
@@ -223,7 +246,8 @@ void NativeProviderBookActivity::renderLoading(bool force) {
   } else {
     std::snprintf(detail, sizeof(detail), "已用时 %u 秒", static_cast<unsigned>(elapsed));
   }
-  const std::string sig = phase + "|" + detail + "|" + std::to_string(pct) + "|" + std::to_string(st.state == M4ContentProvider::ChapterReady::Error);
+  const std::string sig = phase + "|" + detail + "|" + std::to_string(pct) + "|" +
+                          std::to_string(static_cast<int>(st.state)) + "|" + (authRequired ? "auth" : "");
   if (!force && sig == lastLoadingSignature_ && now - lastLoadingPaintMs_ < 1000) return;
   lastLoadingSignature_ = sig;
   lastLoadingPaintMs_ = now;
@@ -240,7 +264,8 @@ void NativeProviderBookActivity::renderLoading(bool force) {
                         static_cast<size_t>(std::min(100, pct)), 100);
   }
   M4UiText::drawCentered(renderer, UI_10_FONT_ID, 330, detail);
-  const auto labels = mappedInput.mapLabels("« 返回", st.state == M4ContentProvider::ChapterReady::Error ? "重试" : "", "", "");
+  const char* primary = authRequired ? "登录" : (st.state == M4ContentProvider::ChapterReady::Error ? "重试" : "");
+  const auto labels = mappedInput.mapLabels("« 返回", primary, "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }
@@ -272,6 +297,11 @@ void NativeProviderBookActivity::loop() {
         requestChapter(next);
         return;
       }
+    } else if (state_ == State::Login && loginFinishedPending_) {
+      loginFinishedPending_ = false;
+      if (loginSucceeded_ && loadingIndex_ >= 0) requestChapter(loadingIndex_);
+      else openToc();
+      return;
     } else if (state_ == State::Reader && readerBackPending_) {
       readerBackPending_ = false;
       if (tocSelectionPending_ && tocSelectedIndex_ >= 0) {
@@ -287,6 +317,10 @@ void NativeProviderBookActivity::loop() {
 
   if (state_ == State::Loading) {
     const auto st = M4ContentProviderSession::chapterAt(providerId_, bookId_, loadingIndex_);
+    const auto p = M4NativeProviderManager::progress();
+    const bool authRequired = p.providerId == providerId_ && p.bookId == bookId_ &&
+                              p.chapterIndex0 == loadingIndex_ &&
+                              p.phase == M4NativeProvider::Phase::AuthRequired;
     if (st.state == M4ContentProvider::ChapterReady::Ready) {
       if (!openReadyReader(loadingIndex_)) {
         state_ = State::Error;
@@ -301,9 +335,9 @@ void NativeProviderBookActivity::loop() {
       openToc();
       return;
     }
-    if (st.state == M4ContentProvider::ChapterReady::Error &&
-        mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-      requestChapter(loadingIndex_);
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      if (authRequired) openLogin();
+      else if (st.state == M4ContentProvider::ChapterReady::Error) requestChapter(loadingIndex_);
     }
     return;
   }
