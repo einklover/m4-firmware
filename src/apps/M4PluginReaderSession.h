@@ -45,11 +45,11 @@ inline std::atomic<bool>& openReady() {
 }
 
 // Provider cross-chapter fallback. A native reader can discover that chapter
-// N+1 is not locally openable yet (missing/fetching/empty cache). Historically
-// it queued an OpenRequest with relPath="", which guaranteed one native open
-// failure before Lua could show the downloader. Instead remember only the
-// target chapter index; TxtReaderActivity converts requestPluginClose() into the
-// same switchChapterIndex handoff used by the already-working chapter picker.
+// N+1 is not locally openable yet (missing/fetching/empty/corrupt cache). The
+// reader-side handoff intentionally has no resolved absPath; a real Lua
+// reader.openText / progressive-loader request resolves and validates absPath
+// before queueOpen. Remember only the target chapter index here, then reuse the
+// already-working chapter-picker close -> loading/download -> reopen path.
 inline std::atomic<int>& fallbackSwitchChapterIndex() {
   static std::atomic<int> v{-1};
   return v;
@@ -57,6 +57,10 @@ inline std::atomic<int>& fallbackSwitchChapterIndex() {
 
 inline int pendingFallbackSwitchChapterIndex() {
   return fallbackSwitchChapterIndex().load(std::memory_order_acquire);
+}
+
+inline int takeFallbackSwitchChapterIndex() {
+  return fallbackSwitchChapterIndex().exchange(-1, std::memory_order_acq_rel);
 }
 
 // True from takeOpen until tryLaunch finishes enter/fail — blocks concurrent
@@ -162,12 +166,12 @@ inline bool queueOpen(const M4PluginReaderBridge::OpenRequest& req) {
     return false;
   }
 
-  // Provider chapter-end fallback: an empty relPath is not an openable native
-  // reader request. Treat it as a chapter-selection intent instead of poisoning
-  // the owner queue with a guaranteed EmptyPath failure. The native reader will
-  // close and publish this index through its normal progress snapshot; Lua then
-  // enters the same loading/download flow as a manual chapter-list selection.
-  if (!req.providerId.empty() && req.chapterIndex >= 0 && req.relPath.empty() && req.absPath.empty()) {
+  // Provider reader-side chapter-end fallback. A request with provider/index
+  // but without an already-resolved absolute file is not a safe native open.
+  // This includes both an empty cache path and a non-empty cache path that the
+  // native reader already tried and rejected as empty/corrupt. Real Lua opens
+  // always resolve+validate absPath first, so they remain normal queueOpen work.
+  if (!req.providerId.empty() && req.chapterIndex >= 0 && req.absPath.empty()) {
     openReady().store(false, std::memory_order_relaxed);
     pendingOpen() = {};
     tocReady().store(false, std::memory_order_relaxed);
