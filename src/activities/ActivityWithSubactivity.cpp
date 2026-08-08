@@ -1,11 +1,16 @@
 #include "ActivityWithSubactivity.h"
 
+#include "util/M4TouchNavigation.h"
+
 void ActivityWithSubactivity::exitActivity() {
   if (subActivity) {
     subActivity->onExit();
     subActivity.reset();
   }
   pendingExitSub_ = false;
+  // Child onExit() disables global touch chrome. Restore the parent policy so
+  // reader body returns clean while Settings/library parents regain navigation.
+  M4TouchNavigation::activateForActivity(showTouchNavigation());
 }
 
 void ActivityWithSubactivity::enterNewActivity(Activity* activity) {
