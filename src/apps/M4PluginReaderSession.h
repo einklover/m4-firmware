@@ -44,6 +44,21 @@ inline std::atomic<bool>& openReady() {
   return v;
 }
 
+// Provider cross-chapter fallback. A native reader can discover that chapter
+// N+1 is not locally openable yet (missing/fetching/empty cache). Historically
+// it queued an OpenRequest with relPath="", which guaranteed one native open
+// failure before Lua could show the downloader. Instead remember only the
+// target chapter index; TxtReaderActivity converts requestPluginClose() into the
+// same switchChapterIndex handoff used by the already-working chapter picker.
+inline std::atomic<int>& fallbackSwitchChapterIndex() {
+  static std::atomic<int> v{-1};
+  return v;
+}
+
+inline int pendingFallbackSwitchChapterIndex() {
+  return fallbackSwitchChapterIndex().load(std::memory_order_acquire);
+}
+
 // True from takeOpen until tryLaunch finishes enter/fail — blocks concurrent
 // Lua displayBuffer that would race the native reader display task on e-ink.
 inline std::atomic<bool>& launchInProgress() {
@@ -132,6 +147,7 @@ inline void clearForApp(const std::string& appId) {
   openReady().store(false, std::memory_order_relaxed);
   tocReady().store(false, std::memory_order_relaxed);
   launchInProgress().store(false, std::memory_order_relaxed);
+  fallbackSwitchChapterIndex().store(-1, std::memory_order_release);
   pendingOpen() = {};
   pendingToc() = {};
   progressSlot() = {};
@@ -145,6 +161,23 @@ inline bool queueOpen(const M4PluginReaderBridge::OpenRequest& req) {
   if (!boundAppId().empty() && req.appId != boundAppId()) {
     return false;
   }
+
+  // Provider chapter-end fallback: an empty relPath is not an openable native
+  // reader request. Treat it as a chapter-selection intent instead of poisoning
+  // the owner queue with a guaranteed EmptyPath failure. The native reader will
+  // close and publish this index through its normal progress snapshot; Lua then
+  // enters the same loading/download flow as a manual chapter-list selection.
+  if (!req.providerId.empty() && req.chapterIndex >= 0 && req.relPath.empty() && req.absPath.empty()) {
+    openReady().store(false, std::memory_order_relaxed);
+    pendingOpen() = {};
+    tocReady().store(false, std::memory_order_relaxed);
+    pendingToc() = {};
+    fallbackSwitchChapterIndex().store(req.chapterIndex, std::memory_order_release);
+    return true;
+  }
+
+  // A real open supersedes any old fallback intent.
+  fallbackSwitchChapterIndex().store(-1, std::memory_order_release);
   // Prefer reader open; drop any pending TOC so we never dual-launch.
   tocReady().store(false, std::memory_order_relaxed);
   pendingToc() = {};
@@ -170,6 +203,7 @@ inline bool queueToc(const TocRequest& req) {
   if (!boundAppId().empty() && req.appId != boundAppId()) {
     return false;
   }
+  fallbackSwitchChapterIndex().store(-1, std::memory_order_release);
   // Drop pending reader open if TOC is requested (shelf → TOC path).
   openReady().store(false, std::memory_order_relaxed);
   pendingOpen() = {};
