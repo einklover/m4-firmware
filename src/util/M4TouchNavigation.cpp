@@ -24,6 +24,17 @@ void drawBackIcon(const GfxRenderer& renderer, int cx, int cy) {
   renderer.fillRect(cx - 8, cy, 23, 2, true);
 }
 
+void drawHeaderBackIcon(const GfxRenderer& renderer, int x, int cy) {
+  // Compact chevron only. Fengyan title text starts at ~20 px, so keep all
+  // visible pixels to its left while retaining a much larger invisible hitbox.
+  for (int i = 0; i <= 7; ++i) {
+    renderer.drawPixel(x + i, cy - i, true);
+    renderer.drawPixel(x + i, cy - i + 1, true);
+    renderer.drawPixel(x + i, cy + i, true);
+    renderer.drawPixel(x + i, cy + i + 1, true);
+  }
+}
+
 void drawHomeIcon(const GfxRenderer& renderer, int cx, int cy) {
   // Roof (two 45-degree strokes) + rectangular body. No font glyph is needed
   // for the icon, so navigation remains recognizable during font failures.
@@ -74,12 +85,10 @@ bool hitHome(int x, int y, int screenWidth, int screenHeight) {
 void drawHeaderBack(const GfxRenderer& renderer, const Rect& headerRect) {
 #if defined(CROSSPOINT_MURPHY_M4)
   if (mode() != Mode::HeaderBack || headerRect.width <= 0 || headerRect.height <= 0) return;
-  // Keep the visible icon inside the theme's existing left padding. The hit
-  // area is much larger (56x56), so it is finger-friendly without consuming
-  // title width or changing list geometry.
-  const int cx = headerRect.x + 13;
+  // Visible icon stays inside the theme's existing left padding; hit area is
+  // 56x56, so the control remains easy to tap without changing list geometry.
   const int cy = headerRect.y + headerRect.height / 2 - 2;
-  drawBackIcon(renderer, cx + 5, cy);
+  drawHeaderBackIcon(renderer, headerRect.x + 4, cy);
 #endif
 }
 
