@@ -73,6 +73,9 @@ struct ChapterCatalogSpec {
   std::string fileRelPath;       // required for FileRows
   int uidField0 = 0;
   int titleField0 = 1;
+  // Optional 0-based TSV column for VIP/lock flag (e.g. jjwxc isvip at index 3).
+  // -1 = disabled. When set and value is non-zero / non-"0", native TOC prefixes "VIP ".
+  int vipField0 = -1;
 };
 
 struct BookSpec {

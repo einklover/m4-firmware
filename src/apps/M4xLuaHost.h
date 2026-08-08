@@ -11,6 +11,8 @@
 #include <vector>
 
 class GfxRenderer;
+class HTTPClient;
+class NetworkClientSecure;
 
 // Sandboxed Lua host for one installed app session.
 // Not a strong security boundary: enforces memory + instruction/time budgets
@@ -20,7 +22,7 @@ class GfxRenderer;
 // requestCancel() is the only method safe to call from another task (atomic).
 class M4xLuaHost {
  public:
-  M4xLuaHost() = default;
+  M4xLuaHost();
   ~M4xLuaHost();
 
   M4xLuaHost(const M4xLuaHost&) = delete;
@@ -81,12 +83,30 @@ class M4xLuaHost {
   // Cooperative ContentProvider prefetch while native reader owns the panel.
   // Calls global provider_pump_work() if present; never paints.
   bool callProviderPump(std::string& errorOut);
+  bool loaderNeedsPump() const;
+
+  // Read plugin globals + host list scene into a JSON object (no outer array).
+  // Safe when L_ is null (returns {"lua":false}). Owner-task only.
+  std::string debugUiJson() const;
 
   // Accessed by Lua C bindings in M4xLuaHost.cpp
   GfxRenderer* renderer_ = nullptr;
   M4xInstalledApp app_{};
   std::string dataDir_;   // /apps_data/<id>
   std::string installDir_;  // /apps/<id>
+
+  // One keep-alive TLS connection reused by dl.jsonGet (and later dl.*).
+  // A fresh handshake per request fragments internal RAM with mbedTLS session
+  // buffers, and the 40KB jsonGet gate then blocks later fetches (jjwxc
+  // "list too large; back to shelf and retry"). HTTPClient itself swaps the
+  // connection when the host changes; a dead connection is rebuilt on the
+  // next request (GET<0 path). Owner-task only.
+  std::unique_ptr<NetworkClientSecure> netTls_;
+  std::unique_ptr<HTTPClient> netHttp_;
+  // Drop the keep-alive TLS connection now (frees ~32KB internal RAM that the
+  // mbedTLS session retains). Called before entering the native reader, where
+  // no networking happens — keeps internal headroom for the next chapter.
+  void releaseNetworkSession();
 
   // True only when this host established Wi-Fi via net.connectSaved.
   // On stop, disconnect only if owned (never tear down another component's link).

@@ -31,7 +31,7 @@ void NetworkModeSelectionActivity::onEnter() {
   updateRequired = true;
 
   xTaskCreate(&NetworkModeSelectionActivity::taskTrampoline, "NetworkModeTask",
-              2048,               // Stack size
+              4096,               // Stack size
               this,               // Parameters
               1,                  // Priority
               &displayTaskHandle  // Task handle

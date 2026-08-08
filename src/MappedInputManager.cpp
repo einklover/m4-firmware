@@ -8,6 +8,7 @@
 
 #include "CrossPointSettings.h"
 #include "components/UITheme.h"
+#include "util/M4TouchNavigation.h"
 #include "util/TouchHitGeometry.h"
 
 namespace {
@@ -31,9 +32,12 @@ constexpr unsigned long TOUCH_DOWN_SELECT_DELAY_MS = 90;
 MappedInputManager::MappedInputManager(HalGPIO& gpioRef) : gpio(gpioRef), renderer(nullptr) {}
 
 void MappedInputManager::beginFrame() {
+  tapCacheValid = false;
+  tapCacheHas = false;
   swipeCacheValid = false;
   swipeCacheHas = false;
   syntheticBack = false;
+  touchHeldOverrideValid = false;
 #if defined(CROSSPOINT_MURPHY_M4)
   // Consume one-frame synthetic events exactly once per beginFrame().
   synthKind_ = SynthKind::None;
@@ -195,18 +199,29 @@ int MappedInputManager::getPressedFrontButton() const {
 bool MappedInputManager::hasTouch() const { return gpio.hasTouch() && renderer != nullptr; }
 
 bool MappedInputManager::wasScreenTapped(int& x, int& y) const {
+  if (!tapCacheValid) {
+    tapCacheValid = true;
+    tapCacheHas = false;
 #if defined(CROSSPOINT_MURPHY_M4)
-  if (synthKind_ == SynthKind::Tap) {
-    x = synthTapX_;
-    y = synthTapY_;
-    return true;
-  }
+    if (synthKind_ == SynthKind::Tap) {
+      tapX = synthTapX_;
+      tapY = synthTapY_;
+      tapCacheHas = true;
+    } else
 #endif
-  if (!hasTouch()) return false;
-  float nx = 0.0f;
-  float ny = 0.0f;
-  if (!gpio.wasTouchTap(nx, ny)) return false;
-  renderer->tapToLogical(nx, ny, x, y);
+    if (hasTouch()) {
+      float nx = 0.0f;
+      float ny = 0.0f;
+      if (gpio.wasTouchTap(nx, ny)) {
+        renderer->tapToLogical(nx, ny, tapX, tapY);
+        tapCacheHas = true;
+        rememberTouchHeldTime();
+      }
+    }
+  }
+  if (!tapCacheHas) return false;
+  x = tapX;
+  y = tapY;
   return true;
 }
 
@@ -232,7 +247,15 @@ bool MappedInputManager::isScreenTouchHeld(int& x, int& y) const {
 
 unsigned long MappedInputManager::lastScreenTouchHeldMs() const {
   if (!hasTouch()) return 0;
+  if (touchHeldOverrideValid && millis() - touchHeldOverrideAt <= 250) return touchHeldOverrideMs;
+  touchHeldOverrideValid = false;
   return gpio.lastTouchHeldMs();
+}
+
+void MappedInputManager::rememberTouchHeldTime() const {
+  touchHeldOverrideValid = true;
+  touchHeldOverrideMs = gpio.lastTouchHeldMs();
+  touchHeldOverrideAt = millis();
 }
 
 bool MappedInputManager::wasTapInRect(const int x, const int y, const int width, const int height) const {
@@ -336,18 +359,46 @@ MappedInputManager::SwipeDir MappedInputManager::wasSwipe() const {
 
 bool MappedInputManager::wasBackGesture() const {
   if (!hasTouch()) return false;
+
+#if defined(CROSSPOINT_MURPHY_M4)
+  if (M4TouchNavigation::enabled()) {
+    int tx = 0, ty = 0;
+    if (wasScreenTapped(tx, ty) &&
+        M4TouchNavigation::hitBack(tx, ty, renderer->getScreenWidth(), renderer->getScreenHeight())) {
+      rememberTouchHeldTime();
+      return true;
+    }
+  }
+#endif
+
   int sx = 0, sy = 0, ex = 0, ey = 0;
   if (!decodeSwipe(sx, sy, ex, ey)) return false;
-  return TouchHitGeometry::isSystemBackSwipe(sx, sy, ex, ey, renderer->getScreenWidth(),
-                                             renderer->getScreenHeight());
+  const bool hit = TouchHitGeometry::isSystemBackSwipe(sx, sy, ex, ey, renderer->getScreenWidth(),
+                                                       renderer->getScreenHeight());
+  if (hit) rememberTouchHeldTime();
+  return hit;
 }
 
 bool MappedInputManager::wasHomeGesture() const {
   if (!hasTouch()) return false;
+
+#if defined(CROSSPOINT_MURPHY_M4)
+  if (M4TouchNavigation::mode() == M4TouchNavigation::Mode::BottomBackHome) {
+    int tx = 0, ty = 0;
+    if (wasScreenTapped(tx, ty) &&
+        M4TouchNavigation::hitHome(tx, ty, renderer->getScreenWidth(), renderer->getScreenHeight())) {
+      rememberTouchHeldTime();
+      return true;
+    }
+  }
+#endif
+
   int sx = 0, sy = 0, ex = 0, ey = 0;
   if (!decodeSwipe(sx, sy, ex, ey)) return false;
-  return TouchHitGeometry::isSystemHomeSwipe(sx, sy, ex, ey, renderer->getScreenWidth(),
-                                             renderer->getScreenHeight());
+  const bool hit = TouchHitGeometry::isSystemHomeSwipe(sx, sy, ex, ey, renderer->getScreenWidth(),
+                                                       renderer->getScreenHeight());
+  if (hit) rememberTouchHeldTime();
+  return hit;
 }
 
 bool MappedInputManager::wasMenuGesture() const {

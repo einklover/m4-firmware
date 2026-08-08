@@ -85,6 +85,9 @@ void DeveloperOptionsActivity::render() {
   M4UiText::draw(renderer, UI_10_FONT_ID, 16, y, L(Str::kUsbSerialDebugWarn3), true);
   y += 36;
   M4UiText::draw(renderer, UI_10_FONT_ID, 16, y, L(Str::kUsbSerialDebugPersist), true);
+  y += 28;
+  // Plugin error log path is fixed; keep ASCII/safe CJK for the subset font.
+  M4UiText::draw(renderer, UI_10_FONT_ID, 16, y, "插件错误: apps_data/.../logs/error.log", true);
 
   const auto labels = mappedInput.mapLabels(L(Str::kBack), L(Str::kToggle), "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

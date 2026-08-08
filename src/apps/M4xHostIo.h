@@ -31,8 +31,13 @@ inline const char* permissionError(const Permissions& p, Operation op) {
 }
 
 struct Limits {
+  // jsonGet buffers the whole body (PSRAM when present) before projecting
+  // rows into Lua.  The 192KiB hard cap rejected large shelf/catalog
+  // responses (WeRead shelf with 200+ books → "response_too_large"); the Lua
+  // heap headroom check after projection is the real guard, so allow large
+  // bodies up to the stream cap.  Default stays small for unstated requests.
   static constexpr size_t kJsonGetDefault = 160 * 1024;
-  static constexpr size_t kJsonGetHard = 192 * 1024;
+  static constexpr size_t kJsonGetHard = 4 * 1024 * 1024;
   static constexpr size_t kStreamDefault = 768 * 1024;
   static constexpr size_t kStreamHard = 4 * 1024 * 1024;
   static constexpr uint32_t kTimeoutDefaultMs = 30000;
@@ -72,7 +77,11 @@ struct Limits {
 
   static bool validJsonShape(const std::vector<std::string>& path,
                              const std::vector<std::string>& fields) {
-    if (path.empty() || path.size() > kMaxPathDepth || fields.empty() || fields.size() > kMaxFields) {
+    // An empty path addresses the JSON root object.  This is required for
+    // APIs such as Jinjiang chapterContent whose response is
+    // {"content":"..."}, rather than an array nested under a named key.
+    // Keep fields mandatory so callers cannot request an unbounded projection.
+    if (path.size() > kMaxPathDepth || fields.empty() || fields.size() > kMaxFields) {
       return false;
     }
     for (const auto& p : path) if (p.empty() || p.size() > kMaxNameBytes) return false;
@@ -201,13 +210,26 @@ inline const char* streamErrorString(StreamError e) {
 }
 
 // Constant-memory transfer used by all dl.* body paths. expectedSize ==
-// SIZE_MAX means an until-close/chunked body; otherwise early EOF is rejected.
+// SIZE_MAX / (size_t)-1 means an until-close/chunked body; otherwise early
+// EOF is rejected.
+//
+// HTTP keep-alive + Transfer-Encoding: chunked is the common case for CDN
+// bookstore APIs: after the last chunk is delivered, available()==0 but
+// connected() stays true, so a pure "wait for disconnect" loop times out
+// with a full body still buffered.  Treat ~400ms of quiet after progress as
+// EOF for until-close transfers.
 inline StreamResult stream(StreamSource& source, StreamSink& sink, size_t cap,
                            size_t expectedSize, uint32_t timeoutMs,
                            const StreamRuntime& runtime) {
   StreamResult out;
   uint8_t buf[2048];
   const uint32_t start = runtime.nowMs ? runtime.nowMs() : 0;
+  uint32_t lastProgressMs = start;
+  // Quiet window after last byte.  Too short → mid-transfer pause false EOF;
+  // too long → slow UI.  CDN chunked keep-alive ends with quiet, but real
+  // Wi-Fi transfers stall >1s (retransmits) — 700ms truncated the 45KB
+  // jjwxc category JSON at 18KB (InvalidInput). 3s keeps correctness.
+  constexpr uint32_t kIdleEofMs = 3000;
   for (;;) {
     if (runtime.cancelled && runtime.cancelled()) {
       out.error = StreamError::Cancelled;
@@ -247,9 +269,16 @@ inline StreamResult stream(StreamSource& source, StreamSink& sink, size_t cap,
         return out;
       }
       out.bytes += static_cast<size_t>(n);
+      if (runtime.nowMs) lastProgressMs = runtime.nowMs();
       continue;
     }
     if (n == 0) {
+      // Would-block / no data.  Keep-alive chunked bodies end with quiet
+      // sockets that never disconnect — accept idle EOF after progress.
+      if (expectedSize == static_cast<size_t>(-1) && out.bytes > 0 && runtime.nowMs &&
+          static_cast<uint32_t>(runtime.nowMs() - lastProgressMs) >= kIdleEofMs) {
+        return out;
+      }
       if (runtime.wait) runtime.wait();
       continue;
     }

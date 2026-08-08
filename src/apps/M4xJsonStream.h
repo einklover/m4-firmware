@@ -397,4 +397,414 @@ class RecordExtractor {
   bool finished_ = false;
 };
 
+class ScalarStreamExtractor {
+ public:
+  ScalarStreamExtractor(std::vector<std::string> path, std::string field, Sink& sink)
+      : path_(std::move(path)), field_(std::move(field)), sink_(sink) {
+    if (field_.empty() || path_.size() > kMaxDepth) error_ = Error::TokenTooLarge;
+  }
+
+  bool feed(const uint8_t* data, size_t len) {
+    if (error_ != Error::None || finished_) return false;
+    for (size_t i = 0; i < len; ++i) {
+      if (!consume(static_cast<char>(data[i]))) return false;
+    }
+    return true;
+  }
+
+  bool finish() {
+    if (finished_) return error_ == Error::None;
+    finished_ = true;
+    if (error_ != Error::None) return false;
+    if (streamMode_ || lex_ != Lex::Normal) {
+      error_ = Error::Truncated;
+      return false;
+    }
+    if (!fieldSeen_) {
+      error_ = Error::PathNotFound;
+      return false;
+    }
+    return true;
+  }
+
+  Error error() const { return error_; }
+  size_t bytesWritten() const { return bytesWritten_; }
+  bool fieldSeen() const { return fieldSeen_; }
+
+ private:
+  static constexpr size_t kMaxDepth = 48;
+  static constexpr size_t kMaxKeyBytes = 256;
+  // String = short keys only (buffered). SkipString = non-target values discarded
+  // without a size cap (晋江 sayBody/sayBodyV2 常 >256B 且排在 content 之前).
+  enum class Lex : uint8_t { Normal, String, SkipString, Primitive, StreamString };
+  enum class Expect : uint8_t { Value, KeyOrEnd, Colon, ValueAfterColon, CommaOrEnd };
+
+  static bool ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+  bool fail(Error e) {
+    error_ = e;
+    return false;
+  }
+
+  bool pathMatches() const {
+    return depthMatched_ == path_.size();
+  }
+
+  bool writeByte(uint8_t b) {
+    if (!sink_.write(&b, 1)) return fail(Error::SinkFailed);
+    ++bytesWritten_;
+    return true;
+  }
+
+  // Emit a Unicode code point as UTF-8 (BMP + supplementary via surrogates).
+  bool writeCodePoint(uint32_t cp) {
+    if (cp > 0x10FFFF) cp = 0xFFFD;
+    uint8_t buf[4];
+    size_t n = 0;
+    if (cp < 0x80) {
+      buf[n++] = static_cast<uint8_t>(cp);
+    } else if (cp < 0x800) {
+      buf[n++] = static_cast<uint8_t>(0xC0 | (cp >> 6));
+      buf[n++] = static_cast<uint8_t>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+      buf[n++] = static_cast<uint8_t>(0xE0 | (cp >> 12));
+      buf[n++] = static_cast<uint8_t>(0x80 | ((cp >> 6) & 0x3F));
+      buf[n++] = static_cast<uint8_t>(0x80 | (cp & 0x3F));
+    } else {
+      buf[n++] = static_cast<uint8_t>(0xF0 | (cp >> 18));
+      buf[n++] = static_cast<uint8_t>(0x80 | ((cp >> 12) & 0x3F));
+      buf[n++] = static_cast<uint8_t>(0x80 | ((cp >> 6) & 0x3F));
+      buf[n++] = static_cast<uint8_t>(0x80 | (cp & 0x3F));
+    }
+    for (size_t i = 0; i < n; ++i) {
+      if (!writeByte(buf[i])) return false;
+    }
+    return true;
+  }
+
+  static int hexNibble(char h) {
+    if (h >= '0' && h <= '9') return h - '0';
+    if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+    if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+    return -1;
+  }
+
+  // Streaming JSON string unescape. 晋江/番茄 content 常为 \uXXXX 转义中文;
+  // 绝不能写成 '?'，否则整章全是问号。
+  bool streamStringChar(char c) {
+    // Collecting \uXXXX hex digits.
+    if (unicodeLeft_ > 0) {
+      const int nib = hexNibble(c);
+      if (nib < 0) return fail(Error::Syntax);
+      unicodeCode_ = (unicodeCode_ << 4) | static_cast<uint32_t>(nib);
+      --unicodeLeft_;
+      if (unicodeLeft_ > 0) return true;
+
+      // Four hex digits complete.
+      if (unicodeHi_ != 0) {
+        // Expected low surrogate after high.
+        const uint32_t lo = unicodeCode_;
+        uint32_t cp = 0xFFFD;
+        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+          cp = 0x10000 + ((unicodeHi_ - 0xD800) << 10) + (lo - 0xDC00);
+        }
+        unicodeHi_ = 0;
+        unicodeCode_ = 0;
+        return writeCodePoint(cp);
+      }
+      if (unicodeCode_ >= 0xD800 && unicodeCode_ <= 0xDBFF) {
+        // High surrogate: remember and wait for next \u.
+        unicodeHi_ = unicodeCode_;
+        unicodeCode_ = 0;
+        return true;
+      }
+      if (unicodeCode_ >= 0xDC00 && unicodeCode_ <= 0xDFFF) {
+        unicodeCode_ = 0xFFFD;  // lone low surrogate
+      }
+      const uint32_t cp = unicodeCode_;
+      unicodeCode_ = 0;
+      return writeCodePoint(cp);
+    }
+
+    // Pending high surrogate without following \u yet.
+    if (unicodeHi_ != 0) {
+      if (esc_) {
+        esc_ = false;
+        if (c == 'u') {
+          unicodeLeft_ = 4;
+          unicodeCode_ = 0;
+          return true;
+        }
+        // Not \u — flush high as replacement, then handle this escape.
+        if (!writeCodePoint(0xFFFD)) return false;
+        unicodeHi_ = 0;
+        // re-handle as normal escape for `c`
+        if (c == 'u') {
+          unicodeLeft_ = 4;
+          unicodeCode_ = 0;
+          return true;
+        }
+        char out = c;
+        switch (c) {
+          case '"':
+          case '\\':
+          case '/':
+            out = c;
+            break;
+          case 'b':
+            out = '\b';
+            break;
+          case 'f':
+            out = '\f';
+            break;
+          case 'n':
+            out = '\n';
+            break;
+          case 'r':
+            out = '\r';
+            break;
+          case 't':
+            out = '\t';
+            break;
+          default:
+            break;
+        }
+        return writeByte(static_cast<uint8_t>(out));
+      }
+      if (c == '\\') {
+        esc_ = true;
+        return true;
+      }
+      // Flush orphan high surrogate.
+      if (!writeCodePoint(0xFFFD)) return false;
+      unicodeHi_ = 0;
+      // fall through to normal char handling
+    }
+
+    if (esc_) {
+      esc_ = false;
+      if (c == 'u') {
+        unicodeLeft_ = 4;
+        unicodeCode_ = 0;
+        return true;
+      }
+      char out = c;
+      switch (c) {
+        case '"':
+        case '\\':
+        case '/':
+          out = c;
+          break;
+        case 'b':
+          out = '\b';
+          break;
+        case 'f':
+          out = '\f';
+          break;
+        case 'n':
+          out = '\n';
+          break;
+        case 'r':
+          out = '\r';
+          break;
+        case 't':
+          out = '\t';
+          break;
+        default:
+          out = c;
+          break;
+      }
+      return writeByte(static_cast<uint8_t>(out));
+    }
+    if (c == '\\') {
+      esc_ = true;
+      return true;
+    }
+    if (c == '"') {
+      if (unicodeHi_ != 0) {
+        unicodeHi_ = 0;
+        if (!writeCodePoint(0xFFFD)) return false;
+      }
+      streamMode_ = false;
+      lex_ = Lex::Normal;
+      fieldSeen_ = true;
+      expect_ = Expect::CommaOrEnd;
+      return true;
+    }
+    if (static_cast<unsigned char>(c) < 0x20) return fail(Error::Syntax);
+    // Literal UTF-8 multi-byte sequences pass through unchanged.
+    return writeByte(static_cast<uint8_t>(c));
+  }
+
+  bool onStringFinished() {
+    // Key or non-target string value finished into token_ (includes quotes).
+    std::string decoded;
+    size_t end = 0;
+    if (!M4xJsonScan::readString(token_, 0, decoded, end) || end != token_.size()) {
+      return fail(Error::Syntax);
+    }
+    if (expect_ == Expect::KeyOrEnd) {
+      pendingKey_ = std::move(decoded);
+      expect_ = Expect::Colon;
+      return true;
+    }
+    // Non-streamed string value (not our field, or not at target depth).
+    expect_ = Expect::CommaOrEnd;
+    return true;
+  }
+
+  bool consume(char c) {
+    if (lex_ == Lex::StreamString) return streamStringChar(c);
+
+    // Discard non-target string values (any length). Only track escapes + closing quote.
+    if (lex_ == Lex::SkipString) {
+      if (!stringEscaped_ && static_cast<unsigned char>(c) < 0x20) return fail(Error::Syntax);
+      if (stringEscaped_) {
+        stringEscaped_ = false;
+        return true;
+      }
+      if (c == '\\') {
+        stringEscaped_ = true;
+        return true;
+      }
+      if (c == '"') {
+        lex_ = Lex::Normal;
+        expect_ = Expect::CommaOrEnd;
+        return true;
+      }
+      return true;
+    }
+
+    if (lex_ == Lex::String) {
+      if (!stringEscaped_ && static_cast<unsigned char>(c) < 0x20) return fail(Error::Syntax);
+      token_.push_back(c);
+      if (token_.size() > kMaxKeyBytes + 2) return fail(Error::TokenTooLarge);
+      if (stringEscaped_) {
+        stringEscaped_ = false;
+      } else if (c == '\\') {
+        stringEscaped_ = true;
+      } else if (c == '"') {
+        lex_ = Lex::Normal;
+        return onStringFinished();
+      }
+      return true;
+    }
+
+    if (lex_ == Lex::Primitive) {
+      if (!ws(c) && c != ',' && c != ']' && c != '}') {
+        token_.push_back(c);
+        if (token_.size() > 64) return fail(Error::TokenTooLarge);
+        return true;
+      }
+      lex_ = Lex::Normal;
+      expect_ = Expect::CommaOrEnd;
+      // fall through with delimiter
+    }
+
+    if (ws(c)) return true;
+
+    switch (c) {
+      case '{':
+        ++objDepth_;
+        if (static_cast<size_t>(objDepth_) > kMaxDepth) return fail(Error::TokenTooLarge);
+        // Enter next path segment if key matched
+        if (!path_.empty() && depthMatched_ < path_.size() && keyForPath_ &&
+            pendingKey_ == path_[depthMatched_]) {
+          ++depthMatched_;
+        }
+        keyForPath_ = false;
+        pendingKey_.clear();
+        expect_ = Expect::KeyOrEnd;
+        return true;
+      case '}':
+        if (objDepth_ <= 0) return fail(Error::Syntax);
+        --objDepth_;
+        if (depthMatched_ > 0 && static_cast<size_t>(objDepth_) < depthMatched_) {
+          // Left a matched path frame
+          if (depthMatched_ > 0) --depthMatched_;
+        }
+        expect_ = Expect::CommaOrEnd;
+        return true;
+      case '[':
+        ++arrDepth_;
+        expect_ = Expect::Value;
+        return true;
+      case ']':
+        if (arrDepth_ <= 0) return fail(Error::Syntax);
+        --arrDepth_;
+        expect_ = Expect::CommaOrEnd;
+        return true;
+      case ':':
+        if (expect_ != Expect::Colon) return fail(Error::Syntax);
+        // About to read value for pendingKey_
+        if (pathMatches() && pendingKey_ == field_) {
+          wantStreamValue_ = true;
+        } else {
+          wantStreamValue_ = false;
+          keyForPath_ = true;  // value may be object for path
+        }
+        expect_ = Expect::ValueAfterColon;
+        return true;
+      case ',':
+        expect_ = (arrDepth_ > 0 && objDepth_ == 0) ? Expect::Value : Expect::KeyOrEnd;
+        pendingKey_.clear();
+        wantStreamValue_ = false;
+        return true;
+      case '"':
+        if (wantStreamValue_ && expect_ == Expect::ValueAfterColon) {
+          // Start streaming field body (no opening quote written).
+          wantStreamValue_ = false;
+          streamMode_ = true;
+          lex_ = Lex::StreamString;
+          esc_ = false;
+          unicodeLeft_ = 0;
+          unicodeCode_ = 0;
+          unicodeHi_ = 0;
+          return true;
+        }
+        // Object keys: buffer (short). Non-target string values: skip (unbounded).
+        if (expect_ == Expect::KeyOrEnd) {
+          token_.assign(1, '"');
+          lex_ = Lex::String;
+          stringEscaped_ = false;
+          return true;
+        }
+        // Value string that is not our target field (sayBody, messages, …).
+        lex_ = Lex::SkipString;
+        stringEscaped_ = false;
+        return true;
+      default:
+        if (expect_ != Expect::Value && expect_ != Expect::ValueAfterColon) return fail(Error::Syntax);
+        wantStreamValue_ = false;
+        token_.assign(1, c);
+        lex_ = Lex::Primitive;
+        return true;
+    }
+  }
+
+  std::vector<std::string> path_;
+  std::string field_;
+  Sink& sink_;
+  Error error_ = Error::None;
+  Lex lex_ = Lex::Normal;
+  Expect expect_ = Expect::Value;
+  std::string token_;
+  std::string pendingKey_;
+  bool stringEscaped_ = false;
+  bool streamMode_ = false;
+  bool esc_ = false;
+  int unicodeLeft_ = 0;
+  uint32_t unicodeCode_ = 0;
+  uint32_t unicodeHi_ = 0;  // pending high surrogate, 0 if none
+  bool wantStreamValue_ = false;
+  bool keyForPath_ = false;
+  bool fieldSeen_ = false;
+  bool finished_ = false;
+  int objDepth_ = 0;
+  int arrDepth_ = 0;
+  size_t depthMatched_ = 0;
+  size_t bytesWritten_ = 0;
+};
+
+
 }  // namespace M4xJsonStream

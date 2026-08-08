@@ -75,6 +75,30 @@ inline bool registerBook(const BookSpec& in) {
   std::lock_guard<std::mutex> lock(mu());
   if (!in.appId.empty()) boundAppId() = in.appId;
 
+  const std::string key = bookKey(in.providerId, in.bookId);
+  // Preserve Ready / in-flight chapter status across re-register (openText,
+  // history TOC restore, return-to-toc). A wipe here used to drop a successful
+  // next-chapter prefetch so the reader always re-fetched and often failed.
+  std::unordered_map<int, ChapterStatus> keepChapters;
+  int keepLastOpen = 0;
+  size_t keepByte = 0;
+  bool keepHasByte = false;
+  int keepPage0 = 0;
+  int keepPageCount = 0;
+  bool keepHistory = false;
+  {
+    auto it = books().find(key);
+    if (it != books().end()) {
+      keepChapters = std::move(it->second.chapters);
+      keepLastOpen = it->second.lastOpenIndex0;
+      keepByte = it->second.lastByteOffset;
+      keepHasByte = it->second.hasLastByteOffset;
+      keepPage0 = it->second.lastPage0;
+      keepPageCount = it->second.lastPageCount;
+      keepHistory = it->second.historyRegistered;
+    }
+  }
+
   BookState st;
   st.spec = in;
   st.chapterCount = bookChapterCount(in);
@@ -87,10 +111,41 @@ inline bool registerBook(const BookSpec& in) {
     cs.state = ChapterReady::Missing;
     cs.pct = 0;
   }
+  // Merge preserved statuses for indices still in range (FileRows sparse map).
+  for (auto& kv : keepChapters) {
+    const int idx = kv.first;
+    if (idx < 0 || static_cast<size_t>(idx) >= st.chapterCount) continue;
+    ChapterStatus& prev = kv.second;
+    if (prev.state != ChapterReady::Ready && prev.state != ChapterReady::Fetching &&
+        prev.state != ChapterReady::Error) {
+      continue;
+    }
+    ChapterStatus& cs = st.chapters[idx];
+    // Prefer non-empty UID from either side.
+    if (cs.chapterUid.empty() && !prev.chapterUid.empty()) cs.chapterUid = prev.chapterUid;
+    if (!prev.chapterUid.empty() && (cs.chapterUid.empty() || cs.chapterUid == prev.chapterUid)) {
+      cs = prev;
+      cs.providerId = in.providerId;
+      cs.bookId = in.bookId;
+      cs.index0 = idx;
+    } else if (cs.chapterUid.empty()) {
+      cs = prev;
+      cs.providerId = in.providerId;
+      cs.bookId = in.bookId;
+      cs.index0 = idx;
+    }
+  }
   if (in.currentIndex0 >= 0 && static_cast<size_t>(in.currentIndex0) < st.chapterCount) {
     st.lastOpenIndex0 = in.currentIndex0;
+  } else if (static_cast<size_t>(keepLastOpen) < st.chapterCount) {
+    st.lastOpenIndex0 = keepLastOpen;
   }
-  books()[bookKey(in.providerId, in.bookId)] = std::move(st);
+  st.lastByteOffset = keepByte;
+  st.hasLastByteOffset = keepHasByte;
+  st.lastPage0 = keepPage0;
+  st.lastPageCount = keepPageCount;
+  st.historyRegistered = keepHistory;
+  books()[key] = std::move(st);
   return true;
 }
 

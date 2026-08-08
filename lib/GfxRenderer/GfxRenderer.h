@@ -40,6 +40,7 @@ class GfxRenderer {
   bool fadingFix;
   uint8_t* frameBuffer = nullptr;
   uint8_t* bwBufferChunks[BW_BUFFER_NUM_CHUNKS] = {nullptr};
+  uint8_t* lastShownFrame = nullptr;  // persistent prev-page copy (PSRAM)
   uint8_t* rollingHalfBuffer = nullptr;  // for rolling auto-turn half-page blending
   std::map<int, EpdFontFamily> fontMap;
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, const int* y, bool pixelState,
@@ -67,6 +68,19 @@ class GfxRenderer {
   // Explicit replace/upsert for M4 full-CJK epdfont promotion of NOTOSANS/UI IDs.
   void replaceFont(int fontId, EpdFontFamily font);
   bool hasFont(int fontId) const;
+  // Borrow the currently mapped font object. Used by the M4 runtime-TTF loader
+  // to capture the compact builtin UI faces before installing scaled views.
+  // The renderer keeps ownership of the family mapping; callers must not free
+  // the returned font.
+  const EpdFont* getFontPtr(int fontId,
+                           EpdFontFamily::Style style = EpdFontFamily::REGULAR) const {
+    const auto it = fontMap.find(fontId);
+    return it == fontMap.end() ? nullptr : it->second.getFont(style);
+  }
+  // Remove a transient/custom mapping before a font reload. The owning font
+  // object is managed by FontManager; erasing the value copy only drops the
+  // renderer's pointer aliases.
+  void removeFont(int fontId) { fontMap.erase(fontId); }
   // Exact coverage check used by plugin/UI text mapping.  Font backends may
   // return '?' for a missing glyph, so this distinguishes real coverage from
   // that fallback before choosing the reader face.
@@ -172,6 +186,16 @@ class GfxRenderer {
 
   // Low level functions
   uint8_t* getFrameBuffer() const;
+  // Access a stored previous-frame chunk (page-turn animation source).
+  const uint8_t* bwBufferChunk(size_t i) const {
+    return (i < BW_BUFFER_NUM_CHUNKS) ? bwBufferChunks[i] : nullptr;
+  }
+  // Persistent "last displayed frame" for page-turn animation.  Unlike the
+  // AA scratch chunks (stored then freed by restoreBwBuffer), this copy
+  // survives until the next display, so the animation can read the previous
+  // page even after the new page has been rendered into frameBuffer.
+  bool storeLastShown();
+  const uint8_t* getLastShown() const { return lastShownFrame; }
   static size_t getBufferSize();
     //透明壁纸
   void drawPngFromTxtpng(const char* txtpng_file_path) const ;

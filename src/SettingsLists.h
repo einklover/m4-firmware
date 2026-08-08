@@ -97,6 +97,10 @@ inline std::vector<SettingInfo> getSettingsList() {
             "fontSize", "Reader"),
 #endif  // 字号设置项隐藏结束
     SettingInfo::Toggle(L(Str::kFirstLineIndent), &CrossPointSettings::firstlineintented, "firstlineintented","Reader"),
+    // Runtime TTF reader font size (0 = follow the built-in 12/14/16/18 enum).
+    // Shown only for the reader; system/UI faces keep their fixed metrics.
+    // 0 = automatic; explicit TTF reader size is 12..48 px.
+    SettingInfo::Value(L(Str::kFontSize), &CrossPointSettings::customFontSize, 0, 48, 1, "customFontSize", "Reader"),
     SettingInfo::Value(L(Str::kLineSpacing), &CrossPointSettings::customLineSpacing, 5, 20, 1, "lineSpacing", "Reader"),
     SettingInfo::SignedValue(L(Str::kWordSpacing), &CrossPointSettings::wordSpacing, -20, 20, 1, "wordSpacing", "Reader"),
     SettingInfo::Value(L(Str::kTopMargin), &CrossPointSettings::screenMargin_Top, 0,60,1, "screenMarginTop", "Reader"),
@@ -192,6 +196,53 @@ inline std::vector<SettingInfo> getSettingsList() {
       SettingInfo::Enum(L(Str::kSleepTimeout), &CrossPointSettings::sleepTimeout,
                         {L(Str::kVal1Min), L(Str::kVal5Min), L(Str::kVal10Min), L(Str::kVal15Min), L(Str::kVal30Min)},
                         "sleepTimeout", "System"),
+
+#ifdef CROSSPOINT_MURPHY_M4
+      // Page-turn animation (SSD1677 multipass wipe).
+      // CRITICAL: pageTurnAnimationFrameRate stores the raw LUT byte (0x22/0x44/0x88),
+      // NOT an enum index. Using SettingInfo::Enum with that field OOBs on render
+      // (default 0x88 → enumValues[136] → crash when opening System). Map via DynamicEnum.
+      SettingInfo::Toggle(L(Str::kPageTurnAnimation), &CrossPointSettings::pageTurnAnimationEnabled,
+                          "pageTurnAnimationEnabled", "System"),
+      SettingInfo::Enum(L(Str::kPageTurnAnimMode), &CrossPointSettings::pageTurnAnimationPartial,
+                        {L(Str::kPageTurnAnimFull), L(Str::kPageTurnAnimPartial)},
+                        "pageTurnAnimationPartial", "System"),
+      SettingInfo::Value(L(Str::kPageTurnAnimSteps), &CrossPointSettings::pageTurnAnimationSteps, 2, 64, 1,
+                         "pageTurnAnimationSteps", "System"),
+      // Window width in step units (only used when partial=1).
+      SettingInfo::Value(L(Str::kPageTurnAnimMult), &CrossPointSettings::pageTurnAnimationMult, 1, 16, 1,
+                         "pageTurnAnimationMult", "System"),
+      // TP is the LUT phase length nibble (1..16); store as decimal 1..16.
+      SettingInfo::Value(L(Str::kPageTurnAnimTp), &CrossPointSettings::pageTurnAnimationTp, 1, 16, 1,
+                         "pageTurnAnimationTp", "System"),
+      SettingInfo::DynamicEnum(
+          L(Str::kPageTurnAnimFrameRate),
+          {L(Str::kPageTurnFrSlow), L(Str::kPageTurnFrMed), L(Str::kPageTurnFrFast)},
+          []() -> uint8_t {
+            switch (SETTINGS.pageTurnAnimationFrameRate) {
+              case 0x22: return 0;
+              case 0x44: return 1;
+              case 0x88: return 2;
+              default:   return 2;
+            }
+          },
+          [](uint8_t index) {
+            static const uint8_t kRates[] = {0x22, 0x44, 0x88};
+            if (index < 3) {
+              SETTINGS.pageTurnAnimationFrameRate = kRates[index];
+              SETTINGS.saveToFile();
+            }
+          },
+          "pageTurnAnimationFrameRate", "System"),
+      // Tail unit = 100ms (0=off, 10=1s). int8 ValueRange max is 50 → 5s.
+      SettingInfo::Value(L(Str::kPageTurnAnimTail), &CrossPointSettings::pageTurnAnimationTailMs, 0, 50, 1,
+                         "pageTurnAnimationTailMs", "System"),
+      // Dir is already a 0..3 index — plain Enum is safe.
+      SettingInfo::Enum(L(Str::kPageTurnAnimDir), &CrossPointSettings::pageTurnAnimationDir,
+                        {L(Str::kPageTurnDirR2L), L(Str::kPageTurnDirL2R), L(Str::kPageTurnDirB2T),
+                         L(Str::kPageTurnDirT2B)},
+                        "pageTurnAnimationDir", "System"),
+#endif
 
       // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
       SettingInfo::DynamicString(

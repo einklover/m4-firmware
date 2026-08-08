@@ -196,6 +196,11 @@ void EpubReaderSettingsActivity::toggleCurrentSetting() {
       config.displayFormatter = [](int v) -> std::string {
         return std::to_string(v / 10) + "." + std::to_string(v % 10) + "倍";
       };
+    } else if (setting.key && strcmp(setting.key, "customFontSize") == 0) {
+      // 0 = auto (follow the built-in size enum); 12-48 = explicit TTF px size.
+      config.displayFormatter = [](int v) -> std::string {
+        return v == 0 ? "自动" : std::to_string(v);
+      };
     }
     
     auto valuePtr = setting.valuePtr;
@@ -252,6 +257,8 @@ void EpubReaderSettingsActivity::render() const {
           const int v = SETTINGS.*(settings[i].valuePtr);
           if (strcmp(settings[i].name, "行间距") == 0) {
             valueText = std::to_string(v / 10) + "." + std::to_string(v % 10) + "倍";
+          } else if (settings[i].key && strcmp(settings[i].key, "customFontSize") == 0) {
+            valueText = (v == 0) ? "自动" : std::to_string(v);
           } else {
             valueText = std::to_string(v);
           }

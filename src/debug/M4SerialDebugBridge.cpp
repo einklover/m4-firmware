@@ -2,6 +2,8 @@
 
 #include "debug/M4SerialDebugBridge.h"
 
+#include "debug/M4WaveformLab.h"
+
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <GfxRenderer.h>
@@ -197,13 +199,15 @@ bool ensureStaConnected(uint32_t timeoutMs);
 
 }  // namespace
 
-void Bridge::begin(GfxRenderer* renderer, MappedInputManager* input, HostHooks hooks) {
+void Bridge::begin(GfxRenderer* renderer, MappedInputManager* input, HalDisplay* display, HostHooks hooks) {
   renderer_ = renderer;
   input_ = input;
   hooks_ = std::move(hooks);
   auth_ = {};
   intake_.reset();
   intake_.discardUntilNewline = false;
+  // Waveform Lab (hidden USB feature) uses the live panel driver.
+  M4WaveformLab::setDisplay(display);
   // Bridge compiled in; remains unauthorized until Developer Options enables it.
   Serial.printf("[%lu] [M4DBG] serial debug bridge present protocol=%d (auth=off)\n", millis(), kProtocolVersion);
 }
@@ -304,6 +308,12 @@ void Bridge::poll() {
     const int b = Serial.read();
     if (b < 0) break;
     feedByte(static_cast<char>(b));
+  }
+  // Pump the async Waveform Lab animation one step per loop so the main
+  // loop (and its watchdog) never blocks for the whole animation.
+  if (M4WaveformLab::animateActive()) {
+    uint32_t stepMs = 0;
+    M4WaveformLab::pumpAnimateWindow(stepMs);
   }
   if (shotActive_) pollScreenshot();
 }
@@ -480,13 +490,45 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
              "\"sd_ok\":%s,\"screen_w\":%d,\"screen_h\":%d,\"orientation\":%d,"
              "\"wifi_connected\":%s,\"wifi_status\":%d,\"wifi_ssid\":\"%s\",\"wifi_ip\":\"%s\","
              "\"wifi_rssi\":%d,\"caps\":[\"install\",\"install_http\",\"wifi_status\",\"wifi_prepare\","
-             "\"wifi_transfer\",\"sd_probe\",\"launch\",\"tap\",\"key\",\"screenshot\",\"logs\"]}",
+             "\"wifi_transfer\",\"sd_probe\",\"sd_read\",\"launch\",\"tap\",\"key\",\"screenshot\","
+             "\"logs\",\"ui\"]}",
              op, kProtocolVersion, st.firmwareVersion ? st.firmwareVersion : "", activityCopy_, appIdCopy_,
              static_cast<unsigned>(st.freeHeap), static_cast<unsigned>(st.minFreeHeap),
              static_cast<unsigned>(st.freePsram), st.sdOk ? "true" : "false", st.screenW, st.screenH,
              st.orientation, wifiConnected ? "true" : "false", static_cast<int>(WiFi.status()), wifiSsidSafe,
              wifiIpSafe, wifiRssi);
     replyOk(reqId, out);
+    return;
+  }
+
+  // Structured on-screen / plugin state for automation — no OCR required.
+  // Returns activity + active_app + nested ui dump (failed/error/screen/list).
+  if (strcmp(op, "ui") == 0) {
+    StatusSnapshot st{};
+    if (hooks_.status) st = hooks_.status();
+    strncpy(activityCopy_, st.activity ? st.activity : "", sizeof(activityCopy_) - 1);
+    activityCopy_[sizeof(activityCopy_) - 1] = 0;
+    strncpy(appIdCopy_, st.activeAppId ? st.activeAppId : "", sizeof(appIdCopy_) - 1);
+    appIdCopy_[sizeof(appIdCopy_) - 1] = 0;
+    std::string dump = "{}";
+    if (hooks_.uiDump) {
+      dump = hooks_.uiDump();
+      if (dump.empty()) dump = "{}";
+    }
+    // replyOk b64 buffer is ~1400 chars → keep raw JSON well under ~1000 B.
+    if (dump.size() > 850) {
+      dump.resize(850);
+      while (!dump.empty() && dump.back() != '}') dump.pop_back();
+      if (dump.empty() || dump.back() != '}') dump += '}';
+    }
+    char head[200];
+    snprintf(head, sizeof(head),
+             "{\"op\":\"ui\",\"activity\":\"%s\",\"active_app\":\"%s\",\"ui\":", activityCopy_, appIdCopy_);
+    std::string out = head;
+    out += dump;
+    out += '}';
+    if (out.size() > 1000) out.resize(1000);
+    replyOk(reqId, out.c_str());
     return;
   }
 
@@ -558,8 +600,262 @@ void Bridge::handleReq(const char* reqId, const char* json, size_t jsonLen) {
     return;
   }
 
-  if (strcmp(op, "install_begin") == 0) {
-    // Idempotent: same req id already handled via tryIdemReplay at top.
+  // Bounded SD text/file pull over USB (no Wi-Fi). Only /apps_data/** and
+  // /apps_inbox/** — for plugin error.log and install diagnostics.
+  if (strcmp(op, "sd_read") == 0) {
+    const char* pathIn = doc["path"] | "";
+    int offset = doc["offset"] | -1;  // -1 = read tail
+    int maxn = doc["max"] | 400;
+    if (maxn < 1) maxn = 1;
+    if (maxn > 400) maxn = 400;  // keep reply under serial line budget
+    if (!pathIn || !pathIn[0]) {
+      replyErr(reqId, "bad_path", "缺少 path");
+      return;
+    }
+    // Normalize: allow "apps_data/..." or "/apps_data/..."
+    char abs[192];
+    if (pathIn[0] == '/') {
+      snprintf(abs, sizeof(abs), "%s", pathIn);
+    } else {
+      snprintf(abs, sizeof(abs), "/%s", pathIn);
+    }
+    // Reject traversal / absolute escapes outside allow-list.
+    if (std::strstr(abs, "..") != nullptr) {
+      replyErr(reqId, "bad_path", "路径非法");
+      return;
+    }
+    const bool okRoot = (std::strncmp(abs, "/apps_data/", 11) == 0) ||
+                        (std::strncmp(abs, "/apps_inbox/", 12) == 0) ||
+                        (std::strcmp(abs, "/apps_data") == 0) || (std::strcmp(abs, "/apps_inbox") == 0);
+    if (!okRoot) {
+      replyErr(reqId, "forbidden", "仅允许 apps_data 或 apps_inbox");
+      return;
+    }
+    if (!SdMan.ready()) {
+      replyErr(reqId, "sd_not_ready", "SD 未就绪");
+      return;
+    }
+    if (!SdMan.exists(abs)) {
+      replyErr(reqId, "missing", "文件不存在");
+      return;
+    }
+    FsFile f;
+    if (!SdMan.openFileForRead("M4Dbg", abs, f)) {
+      replyErr(reqId, "open_failed", "无法打开文件");
+      return;
+    }
+    const size_t fsz = static_cast<size_t>(f.fileSize());
+    size_t off = 0;
+    if (offset < 0) {
+      off = (fsz > static_cast<size_t>(maxn)) ? (fsz - static_cast<size_t>(maxn)) : 0;
+    } else {
+      off = static_cast<size_t>(offset);
+      if (off > fsz) off = fsz;
+    }
+    size_t want = static_cast<size_t>(maxn);
+    if (off + want > fsz) want = fsz - off;
+    if (off > 0) f.seek(off);
+    uint8_t raw[400];
+    size_t got = 0;
+    while (got < want) {
+      const int n = f.read(raw + got, want - got);
+      if (n <= 0) break;
+      got += static_cast<size_t>(n);
+    }
+    f.close();
+    char b64[560];
+    M4SerialDebugPolicy::b64Encode(raw, got, b64, sizeof(b64));
+    char pathSafe[160];
+    copyJsonSafe(abs, pathSafe, sizeof(pathSafe));
+    char out[900];
+    snprintf(out, sizeof(out),
+             "{\"op\":\"sd_read\",\"ok\":true,\"path\":\"%s\",\"size\":%u,\"offset\":%u,"
+             "\"n\":%u,\"eof\":%s,\"data_b64\":\"%s\"}",
+             pathSafe, static_cast<unsigned>(fsz), static_cast<unsigned>(off), static_cast<unsigned>(got),
+             (off + got >= fsz) ? "true" : "false", b64);
+    replyOk(reqId, out);
+    return;
+  }
+
+  // --- Waveform Lab (hidden USB feature) ---
+  if (strcmp(op, "lut_begin") == 0) {
+    if (uploadActive_ || shotActive_) {
+      replyErr(reqId, "busy", "设备忙，请稍后重试");
+      return;
+    }
+    const int slot = doc["slot"] | 0;
+    const uint32_t size = doc["size"] | 0;
+    if (slot < 0 || slot > 1) {
+      replyErr(reqId, "bad_slot", "槽位非法");
+      return;
+    }
+    if (size != M4WaveformLab::kFrameBytes) {
+      replyErr(reqId, "bad_size", "帧大小必须为 48000");
+      return;
+    }
+    if (!M4WaveformLab::beginFrameUpload(slot)) {
+      replyErr(reqId, "lab_oom", "PSRAM 帧缓存分配失败");
+      return;
+    }
+    chunk_.begin(size);
+    labFrameActive_ = true;
+    labFrameSlot_ = slot;
+    replyOk(reqId, "{\"op\":\"lut_begin\",\"ready\":true}", true);
+    return;
+  }
+  if (strcmp(op, "lut_upload") == 0) {
+    const char* b64 = doc["lut"] | "";
+    const bool unlock = doc["unlock_voltages"] | false;
+    uint8_t lut[M4WaveformLab::kLutBytes];
+    size_t n = 0;
+    if (!M4SerialDebugPolicy::b64DecodeStrict(b64, strlen(b64), lut, sizeof(lut), n) ||
+        n != M4WaveformLab::kLutBytes) {
+      replyErr(reqId, "bad_lut", "LUT 必须为 110 字节");
+      return;
+    }
+    if (!M4WaveformLab::setLut(lut, n, unlock)) {
+      replyErr(reqId, "lut_locked", "电压字节被锁定（unlock_voltages=true 才可改）");
+      return;
+    }
+    replyOk(reqId, "{\"op\":\"lut_upload\",\"ok\":true}", true);
+    return;
+  }
+  if (strcmp(op, "lut_set_frames") == 0) {
+    const char* prev = doc["prev"] | "";
+    const char* next = doc["next"] | "";
+    if (!prev[0] || !next[0]) {
+      replyErr(reqId, "bad_path", "prev/next 路径必填");
+      return;
+    }
+    if (!M4WaveformLab::setSdFrames(prev, next)) {
+      replyErr(reqId, "bad_frames", "SD 帧不存在或大小不是 48000");
+      return;
+    }
+    replyOk(reqId, "{\"op\":\"lut_set_frames\",\"ok\":true}", true);
+    return;
+  }
+  if (strcmp(op, "lut_settle") == 0) {
+    const char* prev = doc["prev"] | "";
+    const char* next = doc["next"] | "";
+    if (!prev[0] || !next[0]) {
+      replyErr(reqId, "bad_path", "prev/next 路径必填");
+      return;
+    }
+    const uint32_t ms = M4WaveformLab::runSettle(prev, next);
+    if (ms == 0) {
+      replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
+      return;
+    }
+    char out[96];
+    snprintf(out, sizeof(out), "{\"op\":\"lut_settle\",\"ok\":true,\"ms\":%u}",
+             static_cast<unsigned>(ms));
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_wipe") == 0) {
+    const char* prev = doc["prev"] | "";
+    const char* next = doc["next"] | "";
+    const int steps = doc["steps"] | 8;
+    const uint32_t tailMs = doc["tail_ms"] | 0;
+    const int winMult = doc["win_mult"] | 1;  // window width in step units
+    const int dir = doc["dir"] | 0;
+    if (!prev[0] || !next[0]) {
+      replyErr(reqId, "bad_path", "prev/next 路径必填");
+      return;
+    }
+    const uint32_t ms = M4WaveformLab::runAnimateWindow(prev, next, steps, tailMs, winMult, dir);
+    if (ms == 0) {
+      replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
+      return;
+    }
+    char out[128];
+    snprintf(out, sizeof(out),
+             "{\"op\":\"lut_wipe\",\"ok\":true,\"ms\":%u,\"steps\":%d,\"win_mult\":%d,"
+             "\"dir\":%d,\"refreshes\":%d}",
+             static_cast<unsigned>(ms), steps, winMult, dir, steps);
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_animate") == 0) {
+    const char* prev = doc["prev"] | "";
+    const char* next = doc["next"] | "";
+    const int steps = doc["steps"] | 6;
+    const int feather = doc["feather"] | 0;
+    const uint32_t tailMs = doc["tail_ms"] | 0;
+    const int dir = doc["dir"] | 0;
+    if (!prev[0] || !next[0]) {
+      replyErr(reqId, "bad_path", "prev/next 路径必填");
+      return;
+    }
+    // Synchronous full-frame synthesis animation (blocking; the loop stays
+    // inside poll for the animation duration — verified stable on device).
+    const uint32_t ms = M4WaveformLab::runAnimate(prev, next, steps, feather, tailMs, dir);
+    if (ms == 0) {
+      replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
+      return;
+    }
+    char out[128];
+    snprintf(out, sizeof(out), "{\"op\":\"lut_animate\",\"ok\":true,\"ms\":%u,\"steps\":%d}",
+             static_cast<unsigned>(ms), steps);
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_baseline") == 0) {
+    const char* frame = doc["frame"] | "";
+    if (!frame[0]) {
+      replyErr(reqId, "bad_path", "frame 路径必填");
+      return;
+    }
+    if (!M4WaveformLab::baselineFromSd(frame)) {
+      replyErr(reqId, "bad_frame", "SD 帧不存在或 FULL 刷新失败");
+      return;
+    }
+    replyOk(reqId, "{\"op\":\"lut_baseline\",\"ok\":true}");
+    return;
+  }
+  if (strcmp(op, "lut_run") == 0) {
+    const bool swap = doc["swap"] | false;
+    const uint32_t ms = M4WaveformLab::runRefresh(swap);
+    if (ms == 0) {
+      replyErr(reqId, "not_ready", "帧或 LUT 未就绪");
+      return;
+    }
+    char out[96];
+    snprintf(out, sizeof(out), "{\"op\":\"lut_run\",\"ok\":true,\"ms\":%u}", static_cast<unsigned>(ms));
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_swap") == 0) {
+    M4WaveformLab::swapSlots();
+    replyOk(reqId, "{\"op\":\"lut_swap\",\"ok\":true}");
+    return;
+  }
+  if (strcmp(op, "lut_stats") == 0) {
+    const auto s = M4WaveformLab::stats();
+    const bool anim = M4WaveformLab::animateActive();
+    char out[200];
+    snprintf(out, sizeof(out),
+             "{\"op\":\"lut_stats\",\"ok\":true,\"last_ms\":%u,\"runs\":%u,\"lut_set\":%s,"
+             "\"active\":%s,\"frames_ready\":%s,\"animating\":%s}",
+             static_cast<unsigned>(s.lastRunMs), static_cast<unsigned>(s.runs),
+             s.lutSet ? "true" : "false", s.active ? "true" : "false",
+             s.framesReady ? "true" : "false", anim ? "true" : "false");
+    replyOk(reqId, out);
+    return;
+  }
+  if (strcmp(op, "lut_clear") == 0) {
+    M4WaveformLab::clearAll();
+    replyOk(reqId, "{\"op\":\"lut_clear\",\"ok\":true}");
+    return;
+  }
+  if (strcmp(op, "lut_end") == 0) {
+    abortUpload(false);
+    labFrameActive_ = false;
+    replyOk(reqId, "{\"op\":\"lut_end\",\"ok\":true}", true);
+    return;
+  }
+
+  if (strcmp(op, "install_begin") == 0) {  // Idempotent: same req id already handled via tryIdemReplay at top.
     if (uploadActive_ || shotActive_) {
       replyErr(reqId, "busy", "设备忙，请稍后重试");
       return;
@@ -777,6 +1073,7 @@ void Bridge::abortUpload(bool removePart) {
   uploadName_[0] = 0;
   chunk_.reset();
   lastChunkAckJson_[0] = 0;
+  labFrameActive_ = false;
 }
 
 void Bridge::handleChk(const char* reqId, uint32_t seq, uint32_t total, const uint8_t* data, size_t len) {
@@ -796,6 +1093,23 @@ void Bridge::handleChk(const char* reqId, uint32_t seq, uint32_t total, const ui
                 strcmp(err, "size_overflow") == 0)) {
       abortUpload(true);
     }
+    return;
+  }
+
+  if (labFrameActive_) {
+    if (!M4WaveformLab::frameChunkAppend(data, len)) {
+      replyErr(reqId, "lab_frame", "帧上传失败");
+      abortUpload(false);
+      return;
+    }
+    chunk_.commitAccept(reqId, seq, total, len);
+    if (chunk_.bytesReceived == chunk_.byteTotal) {
+      M4WaveformLab::endFrameUpload(labFrameSlot_);
+      labFrameActive_ = false;
+    }
+    snprintf(lastChunkAckJson_, sizeof(lastChunkAckJson_), "{\"chunk\":%u,\"received\":%u}",
+             static_cast<unsigned>(seq), static_cast<unsigned>(chunk_.bytesReceived));
+    replyOk(reqId, lastChunkAckJson_, true);
     return;
   }
 

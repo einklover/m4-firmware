@@ -516,6 +516,13 @@ void setupDisplayAndFonts() {
 
 void setup() {
     // force serial for debugging
+    // USB CDC RX queue is small by default; the debug bridge sends control
+    // frames up to ~800B (Waveform Lab LUT uploads) and the e-ink main loop
+    // can be blocked by BUSY for 100+ ms, so a tiny queue drops frames.
+    // Enlarge before begin() (runtime, the compile-time macro is ignored).
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+    Serial.setRxBufferSize(8192);
+#endif
     Serial.begin(115200);
     delay(500);
     Serial.printf("[%lu] [M4-RC1] setup() start ver=" CROSSPOINT_VERSION "\n", millis());
@@ -817,6 +824,20 @@ void setup() {
         st.orientation = static_cast<int>(renderer.getOrientation());
         return st;
       };
+      // Text-level UI dump for automated debug (prefer over OCR/screenshot).
+      hooks.uiDump = []() -> std::string {
+        if (!currentActivity) {
+          return "{\"kind\":\"none\"}";
+        }
+        std::string body = currentActivity->debugUiJson();
+        if (body.empty()) body = "{}";
+        std::string out = "{\"activity_name\":\"";
+        out += currentActivity->getName();
+        out += "\",\"body\":";
+        out += body;
+        out += '}';
+        return out;
+      };
       hooks.goHome = []() { onGoHome(); };
       hooks.openFileTransferUi = []() { onGoToFileTransferUsb(); };
       hooks.noteActiveApp = [](const std::string& id) { gDebugActiveAppId = id; };
@@ -859,7 +880,7 @@ void setup() {
         code = r.manifest.versionCode;
         return true;
       };
-      gM4DebugBridge.begin(&renderer, &mappedInputManager, std::move(hooks));
+      gM4DebugBridge.begin(&renderer, &mappedInputManager, &display, std::move(hooks));
       // Apply persisted setting (default off). No serial path can enable this.
       gM4DebugBridge.setAuthorized(SETTINGS.developerSerialDebugEnabled == 1);
     }
@@ -1138,7 +1159,7 @@ void loop() {
   }
 
   // Global full-screen navigation gestures (all activities):
-  //   • right-edge swipe left → Back (synthetic button so every page responds)
+  //   • edge swipe (either direction) → Back (synthetic button so every page responds)
   //   • bottom-edge swipe up  → Home
   mappedInputManager.beginFrame();
 #ifdef CROSSPOINT_MURPHY_M4
@@ -1146,9 +1167,10 @@ void loop() {
     if (!currentActivity->isHomeActivity() && mappedInputManager.wasHomeGesture()) {
       Serial.printf("[%lu] [M4-GESTURE] home (bottom swipe up)\n", millis());
       onGoHome();
-      // Home activity entered; skip previous activity loop this frame.
+      // Home activity entered; never run the old activity again this frame.
+      return;
     } else if (!currentActivity->isHomeActivity() && mappedInputManager.wasBackGesture()) {
-      Serial.printf("[%lu] [M4-GESTURE] back (right-edge swipe left)\n", millis());
+      Serial.printf("[%lu] [M4-GESTURE] back (edge swipe)\n", millis());
       // Pulse logical Back so button paths and wasBackGesture both see it.
       mappedInputManager.pulseSyntheticBack();
     }

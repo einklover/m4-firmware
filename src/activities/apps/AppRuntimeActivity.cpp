@@ -5,6 +5,7 @@
 
 #include <GfxRenderer.h>
 #include <Txt.h>
+#include <SDCardManager.h>
 
 #include "MappedInputManager.h"
 #include "fontIds.h"
@@ -110,7 +111,7 @@ void AppRuntimeActivity::handleEventOnOwner(const M4xRuntime::Event& e) {
       if (subActivity) {
         // Still allow cooperative Lua work without painting: chapter prefetch
         // and history-reopen TOC/session restore (provider_pump_work is idle-cheap).
-        if (pluginChildKind_ == PluginChildKind::Reader) {
+        if (pluginChildKind_ == PluginChildKind::Reader || host_.loaderNeedsPump()) {
           std::string pumpErr;
           if (!host_.callProviderPump(pumpErr) && !host_.isCancelRequested()) {
             Serial.printf("[WRCP] provider_pump err=%s\n", pumpErr.c_str());
@@ -334,7 +335,7 @@ void AppRuntimeActivity::runtimeTaskMain() {
             subActivity && pluginChildKind_ == PluginChildKind::Reader &&
             M4ContentProviderSession::pendingWorkCount() > 0;
         const uint32_t idleMs =
-            (host_.wantsPump() || providerBusy) ? kPumpIdleDrawMs : kIdleDrawMs;
+            (host_.wantsPump() || providerBusy || host_.loaderNeedsPump()) ? kPumpIdleDrawMs : kIdleDrawMs;
         if (millis() - lastDrawMs >= idleMs) {
           handleEventOnOwner(M4xRuntime::Event::makeTick());
           lastDrawMs = millis();
@@ -469,14 +470,51 @@ void AppRuntimeActivity::tryLaunchPluginReader() {
 
   Serial.printf("[WR05] t=%lu launch_begin gen=%u path=%s\n", static_cast<unsigned long>(millis()),
                 static_cast<unsigned>(req.generation), req.relPath.c_str());
+  if (req.pendingComplete) {
+    // Loader early-open: the chapter body is still streaming into the file.
+    // Show a loading placeholder instead of paginating the partial body; a
+    // second open (pendingComplete=false) arrives when the body is complete.
+    M4PluginReaderSession::clearLaunchInProgress();
+    renderer.clearScreen();
+    M4UiText::drawCentered(renderer, UI_12_FONT_ID, 220, "加载中…", true, EpdFontFamily::BOLD);
+    M4UiText::drawCentered(renderer, UI_10_FONT_ID, 280, req.title.c_str());
+    renderer.displayBuffer();
+    postEvent(M4xRuntime::Event::makeDraw());
+    return;
+  }
   const uint32_t handoffStartedMs = millis();
+  // Free the plugin's keep-alive TLS session before the native reader runs —
+  // ~32KB internal RAM that otherwise makes the next chapter open OOM. The
+  // reader itself does no networking; provider next-chapter prefetch builds a
+  // fresh handshake, which succeeds when internal RAM is calm (and retries
+  // otherwise).
+  host_.releaseNetworkSession();
   const uint32_t tLoad0 = millis();
   auto txt = std::make_unique<Txt>(req.absPath, "/.crosspoint");
+  const uint32_t tLoadStart = millis();
   const bool loaded = txt->load();
+  const uint32_t tLoadMs = millis() - tLoadStart;
   Serial.printf("[WR05] t=%lu txt_load ok=%d ms=%lu size=%u enc_ok=%d\n", static_cast<unsigned long>(millis()),
-                loaded ? 1 : 0, static_cast<unsigned long>(millis() - tLoad0),
+                loaded ? 1 : 0, static_cast<unsigned long>(tLoadMs),
                 loaded ? static_cast<unsigned>(txt->getFileSize()) : 0u,
                 (loaded && txt->isEncodingSupported()) ? 1 : 0);
+  // Diagnostic to SD (serial unreliable): a slow Txt::load on the main loop is
+  // the classic "open book → watchdog reboot" — long blocking SD scan.
+  {
+    FsFile df = SdMan.open("apps_data/com.jjwxc.client/logs/reader_open.log",
+                           O_WRONLY | O_CREAT | O_APPEND);
+    if (df) {
+      char line[160];
+      const int n = snprintf(line, sizeof(line),
+                             "[%lu] open path=%s load_ms=%lu ok=%d size=%u free=%u\n",
+                             (unsigned long)millis(), req.relPath.c_str(), (unsigned long)tLoadMs,
+                             loaded ? 1 : 0,
+                             loaded ? (unsigned)txt->getFileSize() : 0u,
+                             (unsigned)ESP.getFreeHeap());
+      if (n > 0) df.write(reinterpret_cast<const uint8_t*>(line), (size_t)n);
+      df.close();
+    }
+  }
   if (!loaded || !txt->isEncodingSupported()) {
     // Explicit open failure — never looks like a successful close at page 1.
     M4PluginReaderSession::ProgressSnapshot snap;
@@ -742,4 +780,35 @@ void AppRuntimeActivity::renderError() {
   const char* hint = M4InputProfile::showHardwareKeyHints() ? "返回退出" : "tap to exit";
   M4UiText::drawCentered(renderer, UI_10_FONT_ID, 360, hint);
   renderer.displayBuffer();
+}
+
+std::string AppRuntimeActivity::debugUiJson() {
+  std::string err;
+  copyError(err);
+  std::string out = "{\"kind\":\"app_runtime\",\"app_id\":\"";
+  out += app_.id;
+  out += "\",\"app_name\":\"";
+  out += app_.name;
+  out += "\",\"failed\":";
+  out += failed_.load(std::memory_order_relaxed) ? "true" : "false";
+  out += ",\"ready\":";
+  out += ready_.load(std::memory_order_relaxed) ? "true" : "false";
+  out += ",\"error\":\"";
+  for (unsigned char c : err) {
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+      out.push_back(static_cast<char>(c));
+    } else if (c < 0x20) {
+      char hex[8];
+      snprintf(hex, sizeof(hex), "\\u%04x", c);
+      out += hex;
+    } else {
+      out.push_back(static_cast<char>(c));
+    }
+  }
+  out += "\",\"plugin\":";
+  // Nested plugin dump (already a JSON object).
+  out += host_.debugUiJson();
+  out += '}';
+  return out;
 }

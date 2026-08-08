@@ -56,6 +56,30 @@ class HalDisplay {
 
   void displayGrayBuffer(bool turnOffScreen = false);
 
+  // Waveform Lab: run one prev->next transition with a caller-supplied
+  // 110-byte LUT.  Returns BUSY wait elapsed ms (0 if unsupported).
+  uint32_t waveformLabRefresh(const uint8_t* prev, const uint8_t* next, const uint8_t* lut,
+                              bool turnOff = false);
+  // Waveform Lab: absolute FULL refresh to the given frame (baseline setup).
+  void waveformLabBaseline(const uint8_t* frame);
+  // Waveform Lab: windowed diff refresh (strip-by-strip page-turn animation).
+  uint32_t waveformLabRefreshWindow(const uint8_t* prev, const uint8_t* next, const uint8_t* lut,
+                                    uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                    bool syncAfter = true);
+  uint32_t waveformLabRefreshWindowBufs(const uint8_t* redWin, const uint8_t* bwWin, const uint8_t* lut,
+                                        uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+  // Dual-dose strip pipeline: writeDiff → activate → equalize (selective).
+  void waveformLabWriteDiffWindow(const uint8_t* prev, const uint8_t* next, uint16_t x, uint16_t y, uint16_t w,
+                                  uint16_t h);
+  uint32_t waveformLabActivate(const uint8_t* lut = nullptr);
+  // Window-scoped activate: limits the SSD1677 master activation scan to the
+  // given rectangle (setRamArea), restores the full-panel window afterwards.
+  // Used for local page-turn wipes so status/other regions are never re-driven.
+  uint32_t waveformLabActivateWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                     const uint8_t* lut = nullptr);
+  void waveformLabEqualizeWindow(const uint8_t* frame, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+  void setCustomLUT(bool enabled, const unsigned char* lutData = nullptr);
+
  private:
   EInkDisplay einkDisplay;
 };

@@ -3,14 +3,21 @@
 #include <HardwareSerial.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
+
+#if defined(ESP32)
+#include <esp_heap_caps.h>
+#endif
 
 #include "../../src/CrossPointSettings.h"
 #include "../../src/fontIds.h"
 #include "../../src/managers/FontManager.h"
 #include "../../src/util/M4FontPolicy.h"
+#include "../EpdFont/ScaledEpdFont.h"
 
 std::vector<int> EpdFontLoader::loadedCustomIds;
 M4FontPolicy::LoadResult EpdFontLoader::lastCanonicalResult = M4FontPolicy::LoadResult::NotAttempted;
@@ -39,11 +46,118 @@ int sizeForEnum(uint8_t fontSizeEnum) {
   }
 }
 
+bool isRuntimeTtfFamily(const std::string& familyName) {
+  if (familyName.size() < 4) return false;
+  std::string suffix = familyName.substr(familyName.size() - 4);
+  std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return suffix == ".ttf";
+}
+
+void logFontHeap(const char* stage) {
+#if defined(ESP32)
+  Serial.printf("[M4-FONT-HEAP] stage=%s internal_free=%u internal_largest=%u psram_free=%u\n",
+                stage ? stage : "?",
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
+#else
+  (void)stage;
+#endif
+}
+
+// Runtime TTFs are expensive faces (stream + cmap + cache metadata). Reuse the
+// exact current reader face across settings/layout reloads instead of recreating
+// it whenever orientation or a non-font setting invalidates pagination.
+std::string activeRuntimeTtfFamily;
+int activeRuntimeTtfSize = -1;
+
+// Compact UI/status font IDs stay stable. Once a runtime TTF is selected we
+// replace their renderer mappings with tiny ScaledEpdFont views that borrow the
+// single reader TTF face. Capture the original regular/bold pointers first so a
+// later switch back to system/epdfont restores the exact original families.
+struct RuntimeUiViews {
+  bool captured = false;
+  const EpdFont* originalUi10Regular = nullptr;
+  const EpdFont* originalUi10Bold = nullptr;
+  const EpdFont* originalUi12Regular = nullptr;
+  const EpdFont* originalUi12Bold = nullptr;
+  const EpdFont* originalSmall = nullptr;
+  std::unique_ptr<ScaledEpdFont> ui10;
+  std::unique_ptr<ScaledEpdFont> ui12;
+  std::unique_ptr<ScaledEpdFont> small;
+};
+RuntimeUiViews runtimeUiViews;
+
+float uiScaleFor(const EpdFont* reader, const EpdFont* target) {
+  if (!reader || !target) return 1.0f;
+  const EpdFontData* src = reader->getData(EpdFontStyles::REGULAR);
+  const EpdFontData* dst = target->getData(EpdFontStyles::REGULAR);
+  if (!src || !dst || src->ascender <= 0 || dst->ascender <= 0) return 1.0f;
+  float scale = static_cast<float>(dst->ascender) / static_cast<float>(src->ascender);
+  if (scale <= 0.0f) scale = 1.0f;
+  if (scale > 1.0f) scale = 1.0f;
+  return scale;
+}
+
+void captureRuntimeUiOriginals(GfxRenderer& renderer) {
+  if (runtimeUiViews.captured) return;
+  runtimeUiViews.originalUi10Regular = renderer.getFontPtr(UI_10_FONT_ID, EpdFontFamily::REGULAR);
+  runtimeUiViews.originalUi10Bold = renderer.getFontPtr(UI_10_FONT_ID, EpdFontFamily::BOLD);
+  runtimeUiViews.originalUi12Regular = renderer.getFontPtr(UI_12_FONT_ID, EpdFontFamily::REGULAR);
+  runtimeUiViews.originalUi12Bold = renderer.getFontPtr(UI_12_FONT_ID, EpdFontFamily::BOLD);
+  runtimeUiViews.originalSmall = renderer.getFontPtr(SMALL_FONT_ID, EpdFontFamily::REGULAR);
+  runtimeUiViews.ui10 = std::make_unique<ScaledEpdFont>();
+  runtimeUiViews.ui12 = std::make_unique<ScaledEpdFont>();
+  runtimeUiViews.small = std::make_unique<ScaledEpdFont>();
+  runtimeUiViews.captured = true;
+}
+
+void installRuntimeUiViews(GfxRenderer& renderer, const EpdFont* readerFace) {
+  if (!readerFace) return;
+  captureRuntimeUiOriginals(renderer);
+
+  auto bind = [&](int id, ScaledEpdFont* view, const EpdFont* original) {
+    if (!view || !original) return;
+    const float scale = uiScaleFor(readerFace, original);
+    view->bind(readerFace, scale);
+    // Runtime TTF currently has one regular outline. EpdFontFamily falls back
+    // to regular for bold/italic, matching the reader face while preserving
+    // the compact layout metrics through this scaled view.
+    renderer.replaceFont(id, EpdFontFamily(view));
+    Serial.printf("[M4-FONT] UI scaled view id=%d scale=%.3f source=reader_ttf\n", id, scale);
+  };
+  bind(UI_10_FONT_ID, runtimeUiViews.ui10.get(), runtimeUiViews.originalUi10Regular);
+  bind(UI_12_FONT_ID, runtimeUiViews.ui12.get(), runtimeUiViews.originalUi12Regular);
+  bind(SMALL_FONT_ID, runtimeUiViews.small.get(), runtimeUiViews.originalSmall);
+}
+
+void restoreRuntimeUiViews(GfxRenderer& renderer) {
+  if (!runtimeUiViews.captured) return;
+
+  // Detach scaled views before freeing their borrowed reader TTF source.
+  runtimeUiViews.ui10->bind(nullptr, 1.0f);
+  runtimeUiViews.ui12->bind(nullptr, 1.0f);
+  runtimeUiViews.small->bind(nullptr, 1.0f);
+
+  if (runtimeUiViews.originalUi10Regular) {
+    renderer.replaceFont(UI_10_FONT_ID,
+                         EpdFontFamily(runtimeUiViews.originalUi10Regular, runtimeUiViews.originalUi10Bold));
+  }
+  if (runtimeUiViews.originalUi12Regular) {
+    renderer.replaceFont(UI_12_FONT_ID,
+                         EpdFontFamily(runtimeUiViews.originalUi12Regular, runtimeUiViews.originalUi12Bold));
+  }
+  if (runtimeUiViews.originalSmall) {
+    renderer.replaceFont(SMALL_FONT_ID, EpdFontFamily(runtimeUiViews.originalSmall));
+  }
+}
+
 bool insertCustomFamily(GfxRenderer& renderer, const char* familyName, int size) {
   EpdFontFamily* family = FontManager::getInstance().getCustomFontFamily(familyName, size);
   if (!family) {
-    Serial.printf("[FontLoader] Failed to load '%s' size %d from /fonts/%s.epdfont\n", familyName, size,
-                  familyName);
+    Serial.printf("[FontLoader] Failed to load '%s' size %d\n", familyName, size);
     return false;
   }
   const int id = hashFontId(familyName, size);
@@ -85,9 +199,9 @@ void EpdFontLoader::ensureFontsFromSd(GfxRenderer& renderer) {
 }
 
 void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
+  const std::vector<int> previousCustomIds = loadedCustomIds;
   loadedCustomIds.clear();
   lastCanonicalResult = M4FontPolicy::LoadResult::NotAttempted;
-  FontManager::getInstance().clearLoadedFonts();
   FontManager::getInstance().invalidateScan();
   const auto& families = FontManager::getInstance().getAvailableFamilies();
 
@@ -113,20 +227,86 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
     lastCanonicalResult = M4FontPolicy::LoadResult::Missing;
   }
 
-  // 1) Explicit CUSTOM family → reader hash IDs only (no UI promotion unless canonical).
+  const bool runtimeTtf = !d.loadCustomFamily.empty() && isRuntimeTtfFamily(d.loadCustomFamily);
+  int runtimeReaderSize = -1;
+  bool reuseRuntimeTtf = false;
+  if (runtimeTtf) {
+    runtimeReaderSize = SETTINGS.customFontSize == 0
+                            ? sizeForEnum(SETTINGS.fontSize)
+                            : std::max<int>(12, std::min<int>(48, SETTINGS.customFontSize));
+    const int runtimeId = hashFontId(d.loadCustomFamily.c_str(), runtimeReaderSize);
+    reuseRuntimeTtf = activeRuntimeTtfFamily == d.loadCustomFamily && activeRuntimeTtfSize == runtimeReaderSize &&
+                      renderer.hasFont(runtimeId);
+  }
+
+  if (!reuseRuntimeTtf) {
+    // Old custom mappings are value-copies of families containing raw EpdFont
+    // pointers. Drop their renderer aliases first. UI aliases are restored
+    // before the old TTF source is destroyed.
+    for (int id : previousCustomIds) renderer.removeFont(id);
+    restoreRuntimeUiViews(renderer);
+    FontManager::getInstance().releaseRuntimeTtfFaces();
+    FontManager::getInstance().clearLoadedFonts();
+    activeRuntimeTtfFamily.clear();
+    activeRuntimeTtfSize = -1;
+    logFontHeap("after_release");
+  } else {
+    Serial.printf("[M4-FONT] Reusing runtime TTF face '%s' @%dpx (UI scales this same cache)\n",
+                  d.loadCustomFamily.c_str(), runtimeReaderSize);
+  }
+
+  // 1) Explicit CUSTOM family → reader hash IDs. Runtime TTF is deliberately
+  // ONE rasterizer face: the reader size. UI/status chrome gets lightweight
+  // scaled views over this same face; 12/14/16/18/20/24 no longer allocate
+  // independent cmap/cache/mutex/stream state.
+  const EpdFont* runtimeReaderFace = nullptr;
   if (!d.loadCustomFamily.empty()) {
-    const int sizes[] = {12, 14, 16, 18};
+    std::vector<int> sizes;
+    if (runtimeTtf) {
+      sizes.push_back(runtimeReaderSize);
+    } else {
+      // Preserve legacy epdfont behavior; its fixed bitmap artifact is cheap
+      // compared with the runtime TTF rasterizer and existing IDs depend on it.
+      sizes = {12, 14, 16, 18, 20, 24};
+      const uint8_t explicitSize = SETTINGS.customFontSize == 0
+                                       ? 0
+                                       : std::max<uint8_t>(12, std::min<uint8_t>(48, SETTINGS.customFontSize));
+      if (explicitSize != 0 && std::find(sizes.begin(), sizes.end(), explicitSize) == sizes.end()) {
+        sizes.push_back(explicitSize);
+      }
+    }
+
     bool any = false;
     for (int sz : sizes) {
       any = (loadAndInsertCustom(renderer, d.loadCustomFamily.c_str(), sz, loadedCustomIds) >= 0) || any;
     }
     if (!any) {
       Serial.printf("[M4-FONT] DIAG: failed to load explicit custom '%s'\n", d.loadCustomFamily.c_str());
+      if (runtimeTtf) {
+        activeRuntimeTtfFamily.clear();
+        activeRuntimeTtfSize = -1;
+      }
+    } else if (runtimeTtf) {
+      activeRuntimeTtfFamily = d.loadCustomFamily;
+      activeRuntimeTtfSize = runtimeReaderSize;
+      EpdFontFamily* family = FontManager::getInstance().getCustomFontFamily(d.loadCustomFamily, runtimeReaderSize);
+      runtimeReaderFace = family ? family->getFont(EpdFontFamily::REGULAR) : nullptr;
+      installRuntimeUiViews(renderer, runtimeReaderFace);
+      Serial.printf("[M4-FONT] Runtime TTF single-face mode '%s' reader=%dpx; UI/status share + scale\n",
+                    d.loadCustomFamily.c_str(), runtimeReaderSize);
+      logFontHeap("runtime_ttf_ready");
     } else {
-      Serial.printf("[M4-FONT] Loaded explicit CUSTOM family '%s' for reader (not auto-promoted to UI "
-                    "unless it is the canonical file)\n",
-                    d.loadCustomFamily.c_str());
+      Serial.printf("[M4-FONT] Loaded explicit CUSTOM family '%s' for reader\n", d.loadCustomFamily.c_str());
     }
+  }
+
+  // Exact same TTF face reload: no FontManager work was needed, but keep the UI
+  // views explicitly rebound in case a caller changed renderer mappings.
+  if (runtimeTtf && reuseRuntimeTtf) {
+    EpdFontFamily* family = FontManager::getInstance().getCustomFontFamily(d.loadCustomFamily, runtimeReaderSize);
+    runtimeReaderFace = family ? family->getFont(EpdFontFamily::REGULAR) : nullptr;
+    installRuntimeUiViews(renderer, runtimeReaderFace);
+    logFontHeap("runtime_ttf_reused");
   }
 
   // 2) System/UI promotion: canonical only (never families.front() / Latin-only).
@@ -153,7 +333,11 @@ void EpdFontLoader::loadFontsFromSd(GfxRenderer& renderer) {
   return;
 #endif
 
-  // Non-M4: original behavior — load only when FONT_CUSTOM is set.
+  // Non-M4: original behavior — reload only the selected custom face.
+  for (int id : previousCustomIds) renderer.removeFont(id);
+  restoreRuntimeUiViews(renderer);
+  FontManager::getInstance().releaseRuntimeTtfFaces();
+  FontManager::getInstance().clearLoadedFonts();
   if (SETTINGS.fontFamily == CrossPointSettings::FONT_CUSTOM) {
     if (strlen(SETTINGS.customFontFamily) > 0) {
       Serial.printf("Loading custom font: %s size %d\n", SETTINGS.customFontFamily, SETTINGS.fontSize);

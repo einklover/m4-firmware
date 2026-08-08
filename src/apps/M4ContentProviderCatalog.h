@@ -28,6 +28,17 @@ inline bool fieldAt(const std::string& line, int field0, std::string& out) {
   return false;
 }
 
+// Native TOC only shows title text; plugins (jjwxc) store VIP as a side field.
+// When vipField0 is set and the cell is non-zero / non-"false", prefix "VIP ".
+inline void decorateTitleWithVip(const std::string& line, int vipField0, std::string& title) {
+  if (vipField0 < 0 || title.empty()) return;
+  std::string flag;
+  if (!fieldAt(line, vipField0, flag) || flag.empty()) return;
+  if (flag == "0" || flag == "false" || flag == "nil" || flag == "False") return;
+  if (title.find("VIP") != std::string::npos) return;
+  title.insert(0, "VIP ");
+}
+
 inline bool resolveRow(M4FileRows::FileRowSource& source,
                        const M4ContentProvider::ChapterCatalogSpec& catalog, int index0,
                        M4ContentProvider::ChapterMeta& out, std::string& errorOut,
@@ -36,10 +47,16 @@ inline bool resolveRow(M4FileRows::FileRowSource& source,
   out = {};
   errorOut.clear();
   if (rawLineOut) rawLineOut->clear();
-  if (catalog.kind != ChapterCatalogKind::FileRows || index0 < 0 ||
-      static_cast<size_t>(index0) >= catalog.chapterCount || !source.isOpen() ||
-      source.rowCount() != catalog.chapterCount) {
+  // Accept index within both registered count and on-disk row count. Meta
+  // count can lag/lead the file briefly (TOC rewrite / incomplete .ok); a
+  // hard equality check made next-chapter resolve always fail for those books.
+  if (catalog.kind != ChapterCatalogKind::FileRows || index0 < 0 || !source.isOpen()) {
     errorOut = "bad_catalog";
+    return false;
+  }
+  if (static_cast<size_t>(index0) >= catalog.chapterCount ||
+      static_cast<size_t>(index0) >= source.rowCount()) {
+    errorOut = "row_out_of_range";
     return false;
   }
   const int page = index0 / source.pageSize() + 1;

@@ -16,6 +16,9 @@ namespace M4xLuaSandbox {
 
 // Heap budget for one app session (Lua allocations only).
 inline constexpr size_t kDefaultHeapLimit = 512 * 1024;
+// PSRAM-backed Lua allocations can safely use a bounded larger working set;
+// keep the no-PSRAM device limit unchanged so TLS/UI still have headroom.
+inline constexpr size_t kPsramHeapLimit = 768 * 1024;
 // Instruction steps between hook checks (mask count).
 inline constexpr int kHookStep = 10000;
 // Max VM instructions per protected callback (approx; counted in steps of kHookStep).

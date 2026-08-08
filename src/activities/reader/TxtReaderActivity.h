@@ -13,6 +13,8 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderMenuActivity.h"
 #include "activities/ActivityWithSubactivity.h"
+#include "apps/M4PluginReaderSession.h"
+#include "util/M4ContentProviderContract.h"
 
 class TxtReaderActivity final : public ActivityWithSubactivity {
  public:
@@ -128,7 +130,7 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   // maxReadBytes: exclusive read-window size from offset (0 = default CHUNK_SIZE 8KiB).
   // First-page adaptive path passes growing 8/16/.../48KiB so expansion is real, not a re-read of 8KiB.
   // outJustify: if non-null, write per-line justify flags there; if null, write currentPageJustify.
-  // Index builders MUST pass a scratch vector so progressive index does not clobber the
+  // Index builders MUST pass a scratch vector so progressive indexing does not clobber the
   // on-screen page's justify flags (causes mid-read left/justify flicker).
   bool loadPageAtOffset(size_t offset, size_t endoffset, std::vector<std::string>& outLines, size_t& nextOffset,
                         const uint8_t* preloadBuf = nullptr, size_t preloadBufOffset = 0, size_t preloadBufSize = 0,
@@ -145,6 +147,27 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   int chapternum = 0;
   bool chapter_loadPageIndexCache(int chapternum);
   void chapter_savePageIndexCache(int chapternum) const;
+  // Next-chapter page-index prefetch (provider-like). While the current chapter
+  // is fully indexed and the panel idle, chapter N+1's pageOffsets are built in
+  // the background and saved to chapter{N+1}.bin so a cross-chapter open is a
+  // cache hit. SD is time-sliced; never runs during an animation.
+  void libraryPrefetchReset();
+  bool chapter_pageIndexCacheExists(int ch) const;
+  void chapter_savePageIndexCacheOffsets(int ch, const std::vector<size_t>& offsets) const;
+  void libraryIdlePrefetchNextChapter();
+  // Diagnostic: append a page-load failure reason to the SD debug log (serial
+  // channel is unreliable on M4) so "every-other-page refresh" root causes are
+  // readable from the host.
+  void logPageLoadFail(const char* why, size_t offset, size_t bytes) const;
+  // Perf diagnostic: append a stage timing line to the SD perf log (serial
+  // channel is unreliable on M4). Used to find which render step is slow
+  // (TTF glyph rasterization vs SD read/decode vs physical refresh).
+  void logPerf(const char* step, uint32_t ms, int page, uint32_t extra = 0) const;
+  // Physical body rectangle (panel-native 800x480, byte-aligned) — the page-turn
+  // wipe window covers exactly this so status/other regions are off-panel.
+  bool computeBodyPhysicalWindow(uint16_t& x, uint16_t& y, uint16_t& w, uint16_t& h) const;
+  int statusBarLogicalTopY() const;
+  bool computeStatusBarPhysicalWindow(uint16_t& x, uint16_t& y, uint16_t& w, uint16_t& h) const;
   void chapter_initializeReader(int chapternum);
   bool chapter_initialized = false;
   bool needIndent = SETTINGS.firstlineintented;
@@ -175,9 +198,38 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
 
   // --- Plugin session ---
   PluginSession pluginSession_{};
-  bool pluginCloseRequested_ = false;
   // Set when plugin TOC selects another chapter; published in pluginProgressSnapshot.
   int pluginSwitchChapterIndex_ = -1;
+
+  // bool-like close flag with one narrowly scoped side effect: if the provider
+  // bridge has converted an empty-path next-chapter open into a list-style
+  // fallback intent, the first requestPluginClose() copies that chapter index
+  // into the existing reader progress field and schedules the normal onGoBack
+  // callback. Thus automatic chapter-end fallback follows exactly the same
+  // tested close → Lua loading page → download → reopen path as manual TOC.
+  struct PluginCloseFlag {
+    bool value = false;
+    bool* pendingGoBack = nullptr;
+    int* switchChapterIndex = nullptr;
+
+    PluginCloseFlag(bool* goBack, int* switchIndex)
+        : value(false), pendingGoBack(goBack), switchChapterIndex(switchIndex) {}
+
+    PluginCloseFlag& operator=(bool v) {
+      value = v;
+      if (v && pendingGoBack && switchChapterIndex && *switchChapterIndex < 0) {
+        const int fallback = M4PluginReaderSession::pendingFallbackSwitchChapterIndex();
+        if (fallback >= 0) {
+          *switchChapterIndex = fallback;
+          *pendingGoBack = true;
+        }
+      }
+      return *this;
+    }
+    operator bool() const { return value; }
+  };
+  PluginCloseFlag pluginCloseRequested_{&pendingGoBack, &pluginSwitchChapterIndex_};
+
   bool firstPageReady_ = false;
   bool indexComplete_ = true;
   size_t indexRangeEnd_ = 0;   // exclusive file end for progressive index
@@ -187,6 +239,13 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   bool hasPendingRestore_ = false;
   bool userMovedPage_ = false;
   bool tidxSaved_ = false;  // save completed .tidx once per layout generation
+  // Next-chapter prefetch state (library). See libraryIdlePrefetchNextChapter.
+  int prefetchChapter_ = -1;
+  std::vector<size_t> prefetchOffsets_;
+  size_t prefetchCursor_ = 0;
+  size_t prefetchRangeEnd_ = 0;
+  bool prefetchComplete_ = false;
+  bool prefetchSkipped_ = false;
   // First physical paint after openText handoff: layout under lock, then
   // HALF_REFRESH outside the lock (absolute both-plane write — FAST is
   // differential and keeps residual Lua "打开阅读器…" when RED is stale).
@@ -194,6 +253,10 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   bool pluginPendingHalfFlush_ = false;
   // Provider next-chapter overlay (footer/status); empty when idle.
   std::string providerOverlayMsg_;
+  // Last overlay state that drove a physical refresh. Only a state transition
+  // (Missing→Fetching→Error/Ready) repaints the panel; pct-only churn updates
+  // providerOverlayMsg_ in memory without a full-frame differential.
+  M4ContentProvider::ChapterReady providerOverlayState_ = M4ContentProvider::ChapterReady::Ready;
   bool providerPrefetchRequested_ = false;
   bool tryProviderNextChapterAdvance();  // last-page next / seamless open
   void providerIdlePrefetchNext();
@@ -206,10 +269,33 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   // True while finishPhysicalDisplay / plugin half is on the panel (SPI busy).
   // Display task vs UI task: atomic, not volatile (ordering + visibility).
   std::atomic<bool> physicalEpdBusy_{false};
+  bool firstPhysicalShown_ = false;  // first content page has been driven to panel
+  // Enter/return to reader: flush pure white first so page-turn anim and FAST
+  // never diff against the previous activity (shelf/menu/loading residual).
+  bool entryWhiteSeedPending_ = false;
+  // Last body page that received a physical EPD drive. Same-page buffer updates
+  // (status "1/?"→"1/20", footer overlay churn) must NOT FAST-diff again —
+  // that was the residual/ghost buildup while progressive index ran.
+  int lastPhysicalBodyPage_ = -1;
+  // Decoupled quick page skip: rapid taps advance currentPage (user target)
+  // without loading/rendering; the physical refresh catches up once the
+  // in-flight animation finishes and the panel is idle (one full refresh
+  // straight to the target, intermediate pages skipped). No debounce — a slow
+  // tap (panel idle) starts the animation immediately.
+  bool quickMode_ = false;
+  uint32_t lastPageTurnMs_ = 0;
+  // Physical frame snapshot: the page actually laid into the framebuffer and
+  // submitted to the EPD. Updated when render starts; consumed by
+  // finishPhysicalDisplay AFTER the animation settles. NEVER assign
+  // lastPhysicalBodyPage_ from the live currentPage — it keeps advancing
+  // during the animation and would falsely mark the target as already shown
+  // (lost click: catch-up never fires because currentPage==lastPhysicalBodyPage_).
+  int pendingPhysicalPage_ = -1;
   // Set on onExit / openMenu so display task stops starting new frames.
   std::atomic<bool> suppressDisplay_{false};
   void finishPhysicalDisplay();  // displayBuffer + optional AA (no state lock)
   void waitPhysicalEpdIdle(uint32_t maxMs = 2500);
+  void armEntryWhiteSeed();  // white absolute → then first page (anim from white)
 
   // Deferred nested-menu teardown (requestExitSubActivity + apply after pump).
   bool deferredMenuApply_ = false;

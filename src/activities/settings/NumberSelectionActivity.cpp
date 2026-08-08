@@ -2,6 +2,8 @@
 
 #include <GfxRenderer.h>
 
+#include <algorithm>
+
 #include "MappedInputManager.h"
 #include "I18n.h"
 #include "components/UITheme.h"
@@ -63,6 +65,49 @@ void NumberSelectionActivity::loop() {
   if (mappedInput.wasReleased(MappedInputManager::Button::Back) || mappedInput.wasBackGesture()) {
     onCancel();
     return;
+  }
+
+  // Touch controls: tap the slider to set a value, or use the explicit
+  // footer buttons. Horizontal swipes are also treated as back here because
+  // this screen has no horizontal paging action of its own.
+  if (mappedInput.hasTouch()) {
+    int touchX = 0;
+    int touchY = 0;
+    if (mappedInput.wasScreenTapped(touchX, touchY)) {
+      const int screenWidth = renderer.getScreenWidth();
+      const int screenHeight = renderer.getScreenHeight();
+      constexpr int barWidth = 360;
+      constexpr int barHeight = 16;
+      const int barX = (screenWidth - barWidth) / 2;
+      const int barY = 140;
+      const int buttonY = screenHeight - 64;
+      const int buttonH = 50;
+
+      if (touchY >= buttonY && touchY < buttonY + buttonH) {
+        if (touchX < screenWidth / 2) {
+          onCancel();
+        } else {
+          onSelect(value);
+        }
+        return;
+      }
+
+      if (touchX >= barX - 18 && touchX <= barX + barWidth + 18 &&
+          touchY >= barY - 24 && touchY <= barY + barHeight + 24) {
+        const int clampedX = std::max(barX, std::min(barX + barWidth, touchX));
+        const int range = config.maxValue - config.minValue;
+        value = range > 0 ? config.minValue + (clampedX - barX) * range / barWidth : config.minValue;
+        updateRequired = true;
+        return;
+      }
+    }
+
+    const auto swipe = mappedInput.wasSwipe();
+    if (swipe == MappedInputManager::SwipeDir::Left ||
+        swipe == MappedInputManager::SwipeDir::Right) {
+      onCancel();
+      return;
+    }
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
@@ -139,9 +184,26 @@ void NumberSelectionActivity::renderScreen() {
   }
   renderer.drawCenteredText(SMALL_FONT_ID, barY + 30, hintText.c_str(), true);
 
-  // 按钮提示
-  const auto labels = mappedInput.mapLabels(L(Str::kBack), L(Str::kConfirmShort), "-", "+");
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  if (mappedInput.hasTouch()) {
+    // Touch devices need visible actions; the physical-button hint bar is not
+    // an actionable return control on this screen.
+    const int buttonY = renderer.getScreenHeight() - 64;
+    const int buttonH = 50;
+    const int margin = 18;
+    const int gap = 12;
+    const int buttonW = (screenWidth - margin * 2 - gap) / 2;
+    const int backX = margin;
+    const int confirmX = backX + buttonW + gap;
+    renderer.drawRect(backX, buttonY, buttonW, buttonH);
+    renderer.drawRect(confirmX, buttonY, buttonW, buttonH);
+    M4UiText::drawCenteredInBox(renderer, UI_12_FONT_ID, backX, buttonY, buttonW, buttonH,
+                                L(Str::kBack), true);
+    M4UiText::drawCenteredInBox(renderer, UI_12_FONT_ID, confirmX, buttonY, buttonW, buttonH,
+                                L(Str::kConfirmShort), true);
+  } else {
+    const auto labels = mappedInput.mapLabels(L(Str::kBack), L(Str::kConfirmShort), "-", "+");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  }
 
   renderer.displayBuffer();
 }

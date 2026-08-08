@@ -10,6 +10,8 @@
 
 #include <cstring>
 #include <string>
+
+#include <esp_heap_caps.h>
 #include <vector>
 
 #include <HalPowerManager.h>
@@ -268,12 +270,25 @@ void HomeActivity::onEnter() {
   showMemWarning = false;
   memWarningSelected = false;
 
-  // Check min free heap and warn user if memory is critically low
-  const uint32_t minFreeHeap = ESP.getMinFreeHeap();
-  Serial.printf("[%lu] [Home] Min free heap: %lu bytes\n", millis(), minFreeHeap);
-  if (minFreeHeap < 10 * 1024) {
+  // Low-memory warning: use the CURRENT internal heap state, not the
+  // lifetime minimum (ESP.getMinFreeHeap() is the all-time low — a transient
+  // 3.4KB dip during a chapter open would then keep warning long after the
+  // heap recovered to 80KB+, a false positive). Warn only when free internal
+  // RAM is currently critical or the largest free block can't serve a TLS
+  // handshake (~40KB gate).
+  const uint32_t freeInternal =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t largestInternal =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  Serial.printf("[%lu] [Home] internal free=%lu largest=%lu lifetime_min=%lu\n", millis(),
+                static_cast<unsigned long>(freeInternal),
+                static_cast<unsigned long>(largestInternal),
+                static_cast<unsigned long>(ESP.getMinFreeHeap()));
+  if (freeInternal < 20 * 1024 || largestInternal < 12 * 1024) {
     showMemWarning = true;
-    Serial.printf("[%lu] [Home] Low memory warning triggered (min free: %lu bytes)\n", millis(), minFreeHeap);
+    Serial.printf("[%lu] [Home] Low memory warning triggered (free=%lu largest=%lu)\n", millis(),
+                  static_cast<unsigned long>(freeInternal),
+                  static_cast<unsigned long>(largestInternal));
   }
 
   renderingMutex = xSemaphoreCreateMutex();

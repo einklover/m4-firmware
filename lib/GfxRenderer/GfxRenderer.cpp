@@ -969,6 +969,17 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
 
 uint8_t* GfxRenderer::getFrameBuffer() const { return frameBuffer; }
 
+bool GfxRenderer::storeLastShown() {
+  if (!frameBuffer) return false;
+  if (!lastShownFrame) {
+    lastShownFrame = static_cast<uint8_t*>(
+        heap_caps_malloc(HalDisplay::BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!lastShownFrame) return false;
+  }
+  std::memcpy(lastShownFrame, frameBuffer, HalDisplay::BUFFER_SIZE);
+  return true;
+}
+
 size_t GfxRenderer::getBufferSize() { return HalDisplay::BUFFER_SIZE; }
 
 // unused

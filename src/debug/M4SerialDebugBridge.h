@@ -15,6 +15,7 @@
 
 class GfxRenderer;
 class MappedInputManager;
+class HalDisplay;
 
 namespace M4SerialDebug {
 
@@ -43,6 +44,8 @@ struct StatusSnapshot {
 
 struct HostHooks {
   std::function<StatusSnapshot()> status;
+  // Full UI text dump for automation (JSON object string). Prefer this over OCR.
+  std::function<std::string()> uiDump;
   std::function<void()> goHome;
   // Open the native file-transfer activity.  The hook is intentionally
   // separate from goHome so a USB command can present the same UI as the
@@ -59,7 +62,7 @@ struct HostHooks {
 
 class Bridge {
  public:
-  void begin(GfxRenderer* renderer, MappedInputManager* input, HostHooks hooks);
+  void begin(GfxRenderer* renderer, MappedInputManager* input, HalDisplay* display, HostHooks hooks);
   // Owner main loop only. desiredAuthorized comes from SETTINGS (local UI only).
   // Transitions are idempotent; enable flushes stale RX, disable aborts work.
   void setAuthorized(bool desiredAuthorized);
@@ -97,6 +100,10 @@ class Bridge {
   char shotReqId_[kMaxReqIdLen + 1] = {};
   uint32_t shotOffset_ = 0;
   uint32_t shotTotal_ = 0;
+
+  // Waveform Lab frame upload: chunks land in a PSRAM slot instead of SD.
+  bool labFrameActive_ = false;
+  int labFrameSlot_ = 0;
 
   struct IdemSlot {
     char id[kMaxReqIdLen + 1] = {};
